@@ -230,5 +230,5 @@ Come hang out, get help, or share your build on <a href="https://discord.gg/k2BQ
 
 ## Contributing
 
-Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) to get
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.MD) to get
 started.
