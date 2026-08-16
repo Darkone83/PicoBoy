@@ -2,7 +2,7 @@
 
 Thanks for your interest in PicoBoy! Issues, ideas, and pull requests are all
 welcome. If you just want to chat or ask a quick question, hop on the
-**[Discord](DISCORD_INVITE_URL)**.
+<a href="https://discord.gg/k2BQhSJ"><img src="https://github.com/Darkone83/PicoBoy/blob/main/images/discord.svg"></a>.
 
 ## License
 
@@ -69,4 +69,4 @@ in over USB, and dragging the `.uf2` onto the **RPI-RP2** drive.
 ## Questions
 
 Not sure about something? Open an issue or ask on the
-<a href="https://discord.gg/k2BQhSJ"><img src="https://github.com/Darkone83/Picoboy/blob/main/Images/discord.svg"></a> — happy to help you get started.
+<a href="https://discord.gg/k2BQhSJ"><img src="https://github.com/Darkone83/PicoBoy/blob/main/images/discord.svg"></a> — happy to help you get started.
