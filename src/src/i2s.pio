@@ -1,0 +1,47 @@
+; PicoBoy I2S output for MAX98357.
+; Based on Raspberry Pi pico-extras audio_i2s.pio (BSD-3-Clause), non-swapped
+; variant only. 16-bit stereo, MSB-first, autopull @ 32.
+;
+; FIFO word layout (shift LEFT, autopull threshold 32):
+;   | 31 : 16 |  15 : 0 |
+;   |  left   |  right  |
+;
+; Two side-set pins: base = BCLK, base+1 = LRCLK.
+; One OUT pin: data (DOUT).
+; SM clock must run at 64 * sample_rate (see audio.c clock divider).
+
+.program audio_i2s
+.side_set 2
+
+                    ;        /--- LRCLK
+                    ;        |/-- BCLK
+bitloop1:           ;        ||
+    out pins, 1       side 0b10
+    jmp x-- bitloop1  side 0b11
+    out pins, 1       side 0b00
+    set x, 14         side 0b01
+bitloop0:
+    out pins, 1       side 0b00
+    jmp x-- bitloop0  side 0b01
+    out pins, 1       side 0b10
+public entry_point:
+    set x, 14         side 0b11
+
+% c-sdk {
+static inline void audio_i2s_program_init(PIO pio, uint sm, uint offset,
+                                          uint data_pin, uint clock_pin_base) {
+    pio_sm_config c = audio_i2s_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, data_pin, 1);
+    sm_config_set_sideset_pins(&c, clock_pin_base);   // base=BCLK, base+1=LRCLK
+    sm_config_set_out_shift(&c, false, true, 32);     // shift left (MSB first), autopull @32
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);    // deeper TX FIFO
+
+    pio_sm_init(pio, sm, offset, &c);
+
+    uint32_t pin_mask = (1u << data_pin) | (3u << clock_pin_base);
+    pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
+    pio_sm_set_pins(pio, sm, 0);
+
+    pio_sm_exec(pio, sm, pio_encode_jmp(offset + audio_i2s_offset_entry_point));
+}
+%}
