@@ -11,6 +11,13 @@
                                     (((uint16_t)(b)) >> 3)))
 #endif
 
+// Optional status-LED behavior owned by a theme. Status/error/battery states
+// still take priority; this only changes the normal LED_IDLE presentation.
+typedef enum {
+    THEME_LED_STATIC = 0,      // idle LED follows the theme accent
+    THEME_LED_TRANS_CYCLE,     // smooth blue -> pink -> white -> pink -> blue cycle
+} theme_led_mode_t;
+
 // Semantic colour roles. The UI chrome asks the active theme for colours by
 // ROLE, never by literal, so adding/altering a look is just a table entry.
 typedef struct {
@@ -27,6 +34,7 @@ typedef struct {
     uint16_t ok;          // success / "good" status
     uint16_t warn;        // caution status
     uint16_t err;         // error status
+    theme_led_mode_t led_mode; // optional idle-LED animation; omitted entries default static
 } theme_t;
 
 // Active theme: a pointer into the built-in table (no copy, ~0 RAM cost).

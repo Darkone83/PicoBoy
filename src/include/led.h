@@ -30,6 +30,7 @@ void led_init(void);                 // start the animator (call after ws2812_in
 void led_set_state(led_state_t st);  // source of truth for the LED
 void led_set_count(uint8_t groups);  // blips per group for counted-blink states (a code); default 2
 void led_set_idle_rgb565(uint16_t c); // LED_IDLE (menu) base colour follows the UI theme accent
+void led_set_idle_trans_cycle(bool enable); // trans theme: animate idle blue/pink/white; status states still win
 void led_set_battery(led_batt_t b);  // battery overlay, driven by the battery poller
 
 // Hand the LED to direct ws2812_set() control (diagnostics that test the LED);

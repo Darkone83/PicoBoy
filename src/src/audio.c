@@ -145,20 +145,24 @@ void snd_nes_output(int n, const uint8_t *w1, const uint8_t *w2, const uint8_t *
     uint8_t vol = g_settings.volume;              // 0..100 (%)
     for (int i = 0; i < n; i++) {
         if (s_nesfill >= SND_FRAMES) break;       // frame buffer full (flushed in LoadFrame)
-        int s = 0;
+        // Always run the mixer + DC blocker, even while muted. If filter state
+        // freezes at Volume=0, unmuting later compares the current waveform to
+        // stale state and can produce a short pop/transient. Muting only gates
+        // the final sample sent to I2S; the filter continues tracking the APU.
+        int a1 = w1[i], a2 = w2[i], a3 = w3[i], a4 = w4[i], a5 = w5[i];
+        int a6 = w6 ? w6[i] : 0;
+        int l = a1 * 6 + a2 * 3 + a3 * 5 + a4 * 51 + a5 * 80 + a6 * 18;
+        int r = a1 * 3 + a2 * 6 + a3 * 5 + a4 * 51 + a5 * 80 + a6 * 18;
+        int mono = (l + r) >> 1;                  // 0..~41565, unipolar (DC-offset)
+
+        // DC blocker (one-pole high-pass, R~0.996 / fc~28 Hz): recentre at 0
+        // so the amp reproduces the full swing, not a DC pedestal it eats.
+        int hp = mono - s_nes_px + (s_nes_hp - (s_nes_hp >> 8));
+        s_nes_px = mono;
+        s_nes_hp = hp;
+
+        int s = 0;                                // muted output remains true zero
         if (vol) {
-            int a1 = w1[i], a2 = w2[i], a3 = w3[i], a4 = w4[i], a5 = w5[i];
-            int a6 = w6 ? w6[i] : 0;
-            int l = a1 * 6 + a2 * 3 + a3 * 5 + a4 * 51 + a5 * 80 + a6 * 18;
-            int r = a1 * 3 + a2 * 6 + a3 * 5 + a4 * 51 + a5 * 80 + a6 * 18;
-            int mono = (l + r) >> 1;              // 0..~41565, unipolar (DC-offset)
-
-            // DC blocker (one-pole high-pass, R~0.996 / fc~28 Hz): recentre at 0
-            // so the amp reproduces the full swing, not a DC pedestal it eats.
-            int hp = mono - s_nes_px + (s_nes_hp - (s_nes_hp >> 8));
-            s_nes_px = mono;
-            s_nes_hp = hp;
-
             int v = ((hp * vol) / 100) * NES_AUDIO_GAIN_NUM / NES_AUDIO_GAIN_DEN;
             s = nes_soft_clip(v);                 // graceful saturation, not hard clip
         }

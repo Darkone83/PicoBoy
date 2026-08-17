@@ -156,7 +156,7 @@ int main(void) {
     settings_apply();          // backlight + LED brightness (settles at the target)
     battery_init();            // battery/charge monitor -> LED overlay
 
-    menu_t main_menu = { "PicoBoy", main_items, 4, 0 };
+    menu_t main_menu = { "PicoBoy", main_items, 4, 0, false };
     led_set_state(LED_IDLE);   // white heartbeat at rest
     ui_draw_menu(&main_menu);
 
@@ -170,10 +170,26 @@ int main(void) {
         if ((ev & (1u << BTN_DOWN)) && ui_menu_move(&main_menu,  1)) ui_draw_menu(&main_menu);
         if (ev & (1u << BTN_A)) {
             switch (main_menu.sel) {
-                case 0: loader_browse();  break;
-                case 1: load_last_game(); break;
-                case 2: settings_menu();  break;
-                case 3: about_screen();   break;
+                case 0:
+                    ui_transition(UI_TRANSITION_FORWARD);
+                    loader_browse();
+                    ui_transition(UI_TRANSITION_BACK);
+                    break;
+                case 1:
+                    // Launching a game is not another menu level; don't make the
+                    // player wait through UI motion on the hot path.
+                    load_last_game();
+                    break;
+                case 2:
+                    ui_transition(UI_TRANSITION_FORWARD);
+                    settings_menu();
+                    ui_transition(UI_TRANSITION_BACK);
+                    break;
+                case 3:
+                    ui_transition(UI_TRANSITION_FORWARD);
+                    about_screen();
+                    ui_transition(UI_TRANSITION_BACK);
+                    break;
             }
             led_set_state(LED_IDLE);
             ui_draw_menu(&main_menu);

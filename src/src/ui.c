@@ -3,6 +3,7 @@
 #include "pins.h"
 #include "theme.h"
 #include "battery.h"
+#include "pico/stdlib.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -43,6 +44,30 @@ void ui_fill_bg(int x, int y, int w, int h) {
     for (int yy = y + 6; yy < y + h; yy += 14)
         for (int xx = x + 8; xx < x + w - 1; xx += 14)
             st7789_fill_rect(xx, yy, 2, 2, dot);
+}
+
+// Directional page wipe. A true horizontal slide would require either panel
+// readback or a full-screen framebuffer; both are poor trades here. This keeps
+// the spatial cue (forward comes from the right, back from the left) with only
+// panel fills and ~70-100 ms of motion. Selection changes are never animated.
+void ui_transition(ui_transition_t dir) {
+    enum { STEPS = 8 };
+    const int edge_w = 4;
+    uint16_t veil = mix565(g_theme->bg, g_theme->accent, 10, 100);
+
+    for (int i = 1; i <= STEPS; i++) {
+        int covered = LCD_W * i / STEPS;
+        if (dir == UI_TRANSITION_FORWARD) {
+            int x = LCD_W - covered;
+            st7789_fill_rect(x, 0, covered, LCD_H, veil);
+            if (i < STEPS) st7789_fill_rect(x, 0, edge_w, LCD_H, g_theme->accent);
+        } else {
+            st7789_fill_rect(0, 0, covered, LCD_H, veil);
+            if (i < STEPS) st7789_fill_rect(covered - edge_w, 0, edge_w, LCD_H, g_theme->accent);
+        }
+        sleep_ms(7);
+    }
+    st7789_fill(g_theme->bg);
 }
 
 void ui_header_right(const char *title, const char *right) {
@@ -181,63 +206,119 @@ int ui_battery_badge(void) {
 
     return x - 6 - tw;                           // left edge of everything the badge drew
 }
-// Small integer sqrt for the Pac-Man disc.
-static int isqrt_i(int v) {
-    int r = 0;
-    while ((r + 1) * (r + 1) <= v) r++;
-    return r;
-}
+// Tiny 12x12 pixel-art chomper, drawn 2x for a crisp 24x24 sprite.  Keeping
+// this as row masks instead of a mathematically perfect circle makes it read as
+// an arcade sprite at a glance.  Frames are wide-open, half-open and closed.
+#define PAC_SRC_W 12
+#define PAC_SRC_H 12
+#define PAC_SCALE 2
+#define PAC_W     (PAC_SRC_W * PAC_SCALE)
+#define PAC_H     (PAC_SRC_H * PAC_SCALE)
 
-// Pac-Man progress bar. Theme-aware: Pac-Man in warn (yellow), pellets in footer
-// text colour, all over theme bg. Chomps a little each call. Draws in a fixed
-// strip; the caller owns the rest of the screen (header/footer).
-void ui_progress_pacman(int done, int total) {
-    static int prev_px = -1;
-    static int frame   = 0;
-    if (total <= 0) total = 1;
-    if (done  < 0)  done  = 0;
-    if (done  > total) done = total;
-    frame++;
-
-    uint16_t bg = g_theme->bg, pellet = g_theme->footer_fg, pac = g_theme->warn, txc = g_theme->item_fg;
-    const int x0 = 26, x1 = 294, ybar = 116, r = 8;
-    int px = x0 + (x1 - x0) * done / total;
-
-    if (prev_px < 0) {                                   // first step: lay the track once
-        st7789_fill_rect(0, ybar - 26, LCD_W, 52, bg);
-        for (int x = x0; x <= x1; x += 14)
-            st7789_fill_rect(x, ybar - 1, 3, 3, pellet);
-        prev_px = x0 - r;
+static const uint16_t s_pac_frame[3][PAC_SRC_H] = {
+    {   // wide-open
+        0x1F8, 0x3FC, 0x7FE, 0xFE0, 0xFC0, 0xF80,
+        0xF80, 0xFC0, 0xFE0, 0x7FE, 0x3FC, 0x1F8
+    },
+    {   // half-open
+        0x1F8, 0x3FC, 0x7FE, 0xFFF, 0xFF8, 0xFC0,
+        0xFC0, 0xFF8, 0xFFF, 0x7FE, 0x3FC, 0x1F8
+    },
+    {   // nearly closed -- a thin mouth line remains
+        0x1F8, 0x3FC, 0x7FE, 0xFFF, 0xFFF, 0xFF0,
+        0xFF0, 0xFFF, 0xFFF, 0x7FE, 0x3FC, 0x1F8
     }
+};
 
-    // Erase from the old centre through the new one -> eats pellets + old disc.
-    int ex = prev_px - r - 1;
-    int ew = (px - prev_px) + 2 * r + 3;
-    if (ew < 2 * r + 3) ew = 2 * r + 3;
-    st7789_fill_rect(ex, ybar - r - 1, ew, 2 * r + 2, bg);
+static void pac_draw_sprite(int cx, int cy, int frame) {
+    const uint16_t pac = COL_YELLOW;     // keep the character instantly recognisable
+    const uint16_t eye = COL_BLACK;
+    int x0 = cx - PAC_W / 2;
+    int y0 = cy - PAC_H / 2;
 
-    // Pac-Man disc.
-    for (int dy = -r; dy <= r; dy++) {
-        int hw = isqrt_i(r * r - dy * dy);
-        st7789_fill_rect(px - hw, ybar + dy, 2 * hw + 1, 1, pac);
-    }
-    // Mouth: wedge to bg on the right, open on alternate steps (chomp).
-    if (frame & 1) {
-        for (int dy = -r; dy <= r; dy++) {
-            int wlen = r - (dy < 0 ? -dy : dy);
-            if (wlen > 0) st7789_fill_rect(px, ybar + dy, wlen + 2, 1, bg);
+    frame %= 3;
+    for (int sy = 0; sy < PAC_SRC_H; sy++) {
+        uint16_t row = s_pac_frame[frame][sy];
+        int sx = 0;
+        while (sx < PAC_SRC_W) {
+            while (sx < PAC_SRC_W && !(row & (1u << (PAC_SRC_W - 1 - sx)))) sx++;
+            if (sx >= PAC_SRC_W) break;
+            int run = sx;
+            while (sx < PAC_SRC_W && (row & (1u << (PAC_SRC_W - 1 - sx)))) sx++;
+            st7789_fill_rect(x0 + run * PAC_SCALE, y0 + sy * PAC_SCALE,
+                             (sx - run) * PAC_SCALE, PAC_SCALE, pac);
         }
     }
 
-    // % readout above the track.
+    // One chunky pixel is enough to give the silhouette a face instead of a
+    // generic yellow disc.  It stays fixed across all mouth frames.
+    st7789_fill_rect(x0 + 6 * PAC_SCALE, y0 + 3 * PAC_SCALE,
+                     PAC_SCALE, PAC_SCALE, eye);
+}
+
+static void pac_draw_sparkle(int x, int y, uint16_t c) {
+    st7789_fill_rect(x - 3, y,     7, 1, c);
+    st7789_fill_rect(x,     y - 3, 1, 7, c);
+}
+
+// Arcade-style ROM loading indicator. Progress owns horizontal position while
+// elapsed time owns the mouth frame, so a sector taking longer does not lock the
+// character to one particular chomp pose. Pellets disappear as they are eaten;
+// the centre pellet is deliberately larger as a tiny power-pellet nod.
+void ui_progress_pacman(int done, int total) {
+    if (total <= 0) total = 1;
+    if (done < 0) done = 0;
+    if (done > total) done = total;
+
+    const uint16_t bg     = g_theme->bg;
+    const uint16_t pellet = g_theme->footer_fg;
+    const uint16_t txc    = g_theme->item_fg;
+    const int ybar = 118;
+    const int x0 = 28;
+    const int x1 = 292;
+    const int track_y = ybar;
+    int px = x0 + (x1 - x0) * done / total;
+
+    // Redraw only the progress strip. This keeps the header/footer intact and
+    // makes eaten pellets deterministic even if progress advances in big jumps.
+    st7789_fill_rect(0, ybar - 32, LCD_W, 62, bg);
+
+    // Percentage stays visually separate from the sprite track.
     char s[8];
     snprintf(s, sizeof s, "%d%%", done * 100 / total);
     int tw = (int)strlen(s) * GLYPH_W;
-    st7789_fill_rect((LCD_W - 48) / 2, ybar - 24, 48, 10, bg);
-    st7789_draw_string((LCD_W - tw) / 2, ybar - 24, s, txc, bg, 1);
+    st7789_draw_string((LCD_W - tw) / 2, ybar - 30, s, txc, bg, 1);
 
-    prev_px = px;
-    if (done >= total) prev_px = -1;                     // reset for the next load
+    // Pellet lane. Anything at or behind the mouth is considered eaten. The
+    // middle pellet is a 7x7 power pellet, the rest are crisp 3x3 pixels.
+    const int first_pellet = x0 + 18;
+    const int last_pellet  = x1 - 10;
+    const int spacing      = 18;
+    const int eat_x        = px + PAC_W / 3;
+    int centre = (x0 + x1) / 2;
+    for (int x = first_pellet; x <= last_pellet; x += spacing) {
+        if (x <= eat_x) continue;
+        if (x >= centre - spacing / 2 && x <= centre + spacing / 2)
+            st7789_fill_rect(x - 3, track_y - 3, 7, 7, pellet);
+        else
+            st7789_fill_rect(x - 1, track_y - 1, 3, 3, pellet);
+    }
+
+    // Wide -> half -> closed -> half, roughly 11 chomps/sec. Position is tied
+    // only to progress, so animation cadence and load progress are independent.
+    static const uint8_t seq[4] = { 0, 1, 2, 1 };
+    uint32_t tick = to_ms_since_boot(get_absolute_time()) / 90u;
+    int frame = seq[tick & 3u];
+    if (done >= total) frame = 2;                 // finish with the mouth closed
+    pac_draw_sprite(px, ybar, frame);
+
+    if (done >= total) {
+        // Tiny completion sparkle -- visible immediately, but adds no artificial
+        // loading delay before the emulator launches.
+        uint16_t c = g_theme->accent;
+        pac_draw_sparkle(px - 16, ybar - 15, c);
+        pac_draw_sparkle(px - 9,  ybar + 16, c);
+    }
 }
 
 void ui_draw_menu(const menu_t *m) {

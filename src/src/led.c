@@ -19,6 +19,33 @@ static volatile led_batt_t  s_batt   = LED_BATT_NONE;
 
 // LED_IDLE base colour, themeable: follows the UI accent (dim). Default white.
 static volatile uint8_t s_idle_r = 44, s_idle_g = 44, s_idle_b = 44;
+static volatile bool    s_idle_trans_cycle = false;
+
+// Trans-flag idle animation. Base values peak around 60, matching the rest of
+// the status palette; the global LED Bright setting applies afterward. One full
+// blue -> pink -> white -> pink -> blue loop takes ~5 seconds.
+#define TRANS_SEG_TICKS 50u
+static rgb_t mix_rgb(rgb_t a, rgb_t b, uint32_t n, uint32_t d) {
+    rgb_t out;
+    out.r = (uint8_t)((int)a.r + ((int)b.r - (int)a.r) * (int)n / (int)d);
+    out.g = (uint8_t)((int)a.g + ((int)b.g - (int)a.g) * (int)n / (int)d);
+    out.b = (uint8_t)((int)a.b + ((int)b.b - (int)a.b) * (int)n / (int)d);
+    return out;
+}
+
+static rgb_t trans_cycle_color(uint32_t ph) {
+    static const rgb_t key[5] = {
+        { 21, 48, 58 }, // light blue  #5BCEFA, scaled to the status palette
+        { 58, 40, 43 }, // pink        #F5A9B8
+        { 60, 60, 60 }, // white
+        { 58, 40, 43 }, // pink
+        { 21, 48, 58 }, // light blue
+    };
+    uint32_t p = ph % (TRANS_SEG_TICKS * 4u);
+    uint32_t seg = p / TRANS_SEG_TICKS;
+    uint32_t pos = p % TRANS_SEG_TICKS;
+    return mix_rgb(key[seg], key[seg + 1u], pos, TRANS_SEG_TICKS);
+}
 
 static rgb_t color_for(led_state_t st) {
     switch (st) {
@@ -44,8 +71,9 @@ static bool tick(repeating_timer_t *t) {
     (void)t;
     if (s_paused) return true;
     led_state_t st = s_state;
-    rgb_t c = color_for(st);
     uint32_t ph = ++s_phase;
+    rgb_t c = (st == LED_IDLE && s_idle_trans_cycle) ? trans_cycle_color(ph)
+                                                      : color_for(st);
 
     // Battery overlay sits on top of resting states. It never interrupts a
     // flash write, SD op, error code, or boot. LOW is a warning, so it also
@@ -122,6 +150,13 @@ void led_set_idle_rgb565(uint16_t c) {
     s_idle_r = (uint8_t)(r * 60u / 255u);
     s_idle_g = (uint8_t)(g * 60u / 255u);
     s_idle_b = (uint8_t)(b * 60u / 255u);
+}
+
+void led_set_idle_trans_cycle(bool enable) {
+    if (enable != s_idle_trans_cycle) {
+        s_idle_trans_cycle = enable;
+        s_phase = 0;
+    }
 }
 
 void led_pause(void)  { s_paused = true; }

@@ -53,8 +53,9 @@ void settings_init(void) {
         settings_defaults();   // first boot / erased / version mismatch
     }
     if (g_settings.theme >= (uint8_t)theme_count()) g_settings.theme = 0;
-    theme_select(g_settings.theme);   // activate before any UI is drawn
-    led_set_idle_rgb565(g_theme->accent);   // idle LED follows the theme
+    theme_select(g_settings.theme);               // activate before any UI is drawn
+    led_set_idle_rgb565(g_theme->accent);         // static idle colour follows accent
+    led_set_idle_trans_cycle(g_theme->led_mode == THEME_LED_TRANS_CYCLE);
 }
 
 void settings_save(void) {
@@ -71,6 +72,11 @@ void settings_save(void) {
 }
 
 void settings_apply(void) {
+    // Keep the UI theme and its idle-LED behavior in one apply path. This also
+    // means Reset Settings immediately restores the default theme/LED behavior.
+    theme_select(g_settings.theme);
+    led_set_idle_rgb565(g_theme->accent);
+    led_set_idle_trans_cycle(g_theme->led_mode == THEME_LED_TRANS_CYCLE);
     st7789_backlight_level(g_settings.lcd_brightness);
     ws2812_set_brightness(g_settings.led_brightness);  // animator re-applies colour at this level
 }
@@ -131,7 +137,7 @@ static void reset_settings(void) {
 
 static void flash_ops_menu(void) {
     static const char *const items[] = { "Clear ROM", "Reset Settings" };
-    menu_t m = { "Flash Ops", items, 2, 0 };
+    menu_t m = { "Flash Ops", items, 2, 0, false };
     ui_draw_menu(&m);
     while (true) {
         buttons_update();
@@ -209,12 +215,18 @@ void settings_menu(void) {
 
         item_t *it = &items[sel];
         if (it->kind == IT_ACTION) {
-            if (ev & (1u << BTN_A)) { it->action(); draw(sel); continue; }
+            if (ev & (1u << BTN_A)) {
+                ui_transition(UI_TRANSITION_FORWARD);
+                it->action();
+                ui_transition(UI_TRANSITION_BACK);
+                draw(sel);
+                continue;
+            }
         } else if (it->kind == IT_CHOICE) {
             int n = theme_count(), cur = (int)*it->val, nv = cur;
             if (ev & (1u << BTN_LEFT))  nv = (cur - 1 + n) % n;
             if (ev & (1u << BTN_RIGHT)) nv = (cur + 1) % n;
-            if (nv != cur) { *it->val = (uint8_t)nv; theme_select(nv); led_set_idle_rgb565(g_theme->accent); changed = true; }
+            if (nv != cur) { *it->val = (uint8_t)nv; changed = true; }
         } else if (it->kind == IT_TOGGLE) {
             if ((ev & (1u << BTN_LEFT))  &&  *it->val) { *it->val = 0; changed = true; }
             if ((ev & (1u << BTN_RIGHT)) && !*it->val) { *it->val = 1; changed = true; }

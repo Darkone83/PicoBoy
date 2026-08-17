@@ -260,6 +260,7 @@ static bool flash_from_sd(const char *path) {
 
     uint32_t total = (size + FLASH_SECTOR_SIZE - 1) / FLASH_SECTOR_SIZE;
     uint32_t done  = 0;
+    ui_progress_pacman(0, (int)total);          // show the track before the first flash sector
     bool ok = true;
     for (uint32_t off = 0; off < size; off += FLASH_SECTOR_SIZE) {
         UINT br = 0;
@@ -290,6 +291,7 @@ void loader_browse(void) {
         for (int i = 0; i < NSYS; i++) snprintf(s_names[i], MAX_NAME, "%s", SYS[i].name);
         int s = pick_list("Browse ROMs", NSYS, "A open   B back");
         if (s < 0) return;                       // back to main menu
+        ui_transition(UI_TRANSITION_FORWARD);   // system -> ROM list
 
         // ROM picker for the chosen system.
         char path[48];
@@ -299,15 +301,24 @@ void loader_browse(void) {
             char m[40];
             snprintf(m, sizeof m, "No %s ROMs", SYS[s].ext);
             show_msg(SYS[s].name, m, COL_GRAY);
+            ui_transition(UI_TRANSITION_BACK);
             continue;                            // back to system picker
         }
         int f = pick_list(SYS[s].name, n, SYS[s].runnable ? "A load  L/R page  B back" : "L/R page  B back");
-        if (f < 0) continue;
+        if (f < 0) {
+            ui_transition(UI_TRANSITION_BACK);
+            continue;
+        }
 
-        if (!SYS[s].runnable) { show_msg(SYS[s].name, "Core coming in phase 4", COL_PURPLE); continue; }
+        if (!SYS[s].runnable) {
+            show_msg(SYS[s].name, "Core coming in phase 4", COL_PURPLE);
+            ui_transition(UI_TRANSITION_BACK);
+            continue;
+        }
 
         char full[MAX_NAME + 48];
         snprintf(full, sizeof full, "/roms/%s/%s", SYS[s].dir, s_names[f]);
+        ui_transition(UI_TRANSITION_FORWARD);   // ROM list -> load/game
         if (flash_from_sd(full)) {
             char base[MAX_NAME];
             strip_ext(base, sizeof base, s_names[f]);
@@ -328,6 +339,7 @@ void loader_browse(void) {
             }
         }
         // After a game (or a failed load) fall back to the system picker.
+        ui_transition(UI_TRANSITION_BACK);
     }
 }
 
