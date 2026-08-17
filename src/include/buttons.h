@@ -12,11 +12,12 @@ extern const char *const button_names[NUM_BUTTONS];
 
 void buttons_init(void);
 
-// Call once per loop iteration: samples + debounces and latches edge events.
+// Call once per loop iteration. Held state follows the current GPIO sample;
+// rising-edge events use a short bounce lockout without delaying the first press.
 void buttons_update(void);
 
 // Held state bitmask (1 = currently pressed). Valid after buttons_update().
 uint16_t buttons_state(void);
 
-// Edge bitmask: bits that transitioned released->pressed in the last update.
+// Edge bitmask: newly accepted released->pressed transitions from this update.
 uint16_t buttons_pressed(void);
