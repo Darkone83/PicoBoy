@@ -81,13 +81,34 @@ static void ui_header_logo(const char *title) {
     st7789_fill_rect(0, HDR_H - 2, LCD_W, 2, g_theme->accent);
 }
 
-// Small accent keycap with a button letter, corners trimmed to footer bg.
-static void footer_keycap(int x, int cy, char letter) {
-    int w = 12, h = 13, y = cy - h / 2;
+// Small arrow glyph (^ v < >) drawn in an ~7px cell at (gx, gy).
+static void footer_tri(int gx, int gy, char d, uint16_t c) {
+    for (int i = 0; i < 4; i++) {
+        if      (d == '^') st7789_fill_rect(gx + 3 - i, gy + i,     1 + 2 * i, 1, c);
+        else if (d == 'v') st7789_fill_rect(gx + 3 - i, gy + 3 - i, 1 + 2 * i, 1, c);
+        else if (d == '<') st7789_fill_rect(gx + i,     gy + 3 - i, 1, 1 + 2 * i, c);
+        else if (d == '>') st7789_fill_rect(gx + 3 - i, gy + 3 - i, 1, 1 + 2 * i, c);
+    }
+}
+
+// Accent keycap showing 1-2 glyphs (letters or arrows). Returns its pixel width.
+static int footer_cap(int x, int cy, const char *label) {
+    int n = (int)strlen(label);
+    int w = n * 8 + 4, h = 13, y = cy - h / 2;
     pill_trim(x, y, w, h, g_theme->accent, g_theme->footer_bg);
-    char s[2] = { letter, 0 };
-    st7789_draw_string(x + (w - 8) / 2, y + (h - 8) / 2, s,
-                       g_theme->footer_bg, g_theme->accent, 1);
+    uint16_t fg = g_theme->footer_bg, bg = g_theme->accent;
+    int cx = x + 2;
+    for (int i = 0; i < n; i++) {
+        char c = label[i];
+        if (c == '^' || c == 'v' || c == '<' || c == '>')
+            footer_tri(cx, y + (h - 7) / 2, c, fg);
+        else {
+            char s[2] = { c, 0 };
+            st7789_draw_string(cx, y + (h - 8) / 2, s, fg, bg, 1);
+        }
+        cx += 8;
+    }
+    return w;
 }
 
 void ui_footer(const char *hint) {
@@ -102,9 +123,12 @@ void ui_footer(const char *hint) {
         if (!*p) break;
         int n = 0;
         while (p[n] && p[n] != ' ' && n < (int)sizeof(tok) - 1) n++;
-        if (n == 1 && (p[0] == 'A' || p[0] == 'B')) {   // lone A/B -> keycap
-            footer_keycap(x, cy, p[0]);
-            x += 12 + 2;
+        int is_cap = (n >= 1 && n <= 2);                 // 1-2 glyphs, all in the set
+        for (int i = 0; i < n && is_cap; i++)
+            if (!strchr("AB^v<>", p[i])) is_cap = 0;
+        if (is_cap) {
+            char cap[3] = { p[0], n > 1 ? p[1] : (char)0, 0 };
+            x += footer_cap(x, cy, cap) + 2;
         } else {
             for (int i = 0; i < n; i++) tok[i] = p[i];
             tok[n] = 0;
@@ -157,6 +181,65 @@ int ui_battery_badge(void) {
 
     return x - 6 - tw;                           // left edge of everything the badge drew
 }
+// Small integer sqrt for the Pac-Man disc.
+static int isqrt_i(int v) {
+    int r = 0;
+    while ((r + 1) * (r + 1) <= v) r++;
+    return r;
+}
+
+// Pac-Man progress bar. Theme-aware: Pac-Man in warn (yellow), pellets in footer
+// text colour, all over theme bg. Chomps a little each call. Draws in a fixed
+// strip; the caller owns the rest of the screen (header/footer).
+void ui_progress_pacman(int done, int total) {
+    static int prev_px = -1;
+    static int frame   = 0;
+    if (total <= 0) total = 1;
+    if (done  < 0)  done  = 0;
+    if (done  > total) done = total;
+    frame++;
+
+    uint16_t bg = g_theme->bg, pellet = g_theme->footer_fg, pac = g_theme->warn, txc = g_theme->item_fg;
+    const int x0 = 26, x1 = 294, ybar = 116, r = 8;
+    int px = x0 + (x1 - x0) * done / total;
+
+    if (prev_px < 0) {                                   // first step: lay the track once
+        st7789_fill_rect(0, ybar - 26, LCD_W, 52, bg);
+        for (int x = x0; x <= x1; x += 14)
+            st7789_fill_rect(x, ybar - 1, 3, 3, pellet);
+        prev_px = x0 - r;
+    }
+
+    // Erase from the old centre through the new one -> eats pellets + old disc.
+    int ex = prev_px - r - 1;
+    int ew = (px - prev_px) + 2 * r + 3;
+    if (ew < 2 * r + 3) ew = 2 * r + 3;
+    st7789_fill_rect(ex, ybar - r - 1, ew, 2 * r + 2, bg);
+
+    // Pac-Man disc.
+    for (int dy = -r; dy <= r; dy++) {
+        int hw = isqrt_i(r * r - dy * dy);
+        st7789_fill_rect(px - hw, ybar + dy, 2 * hw + 1, 1, pac);
+    }
+    // Mouth: wedge to bg on the right, open on alternate steps (chomp).
+    if (frame & 1) {
+        for (int dy = -r; dy <= r; dy++) {
+            int wlen = r - (dy < 0 ? -dy : dy);
+            if (wlen > 0) st7789_fill_rect(px, ybar + dy, wlen + 2, 1, bg);
+        }
+    }
+
+    // % readout above the track.
+    char s[8];
+    snprintf(s, sizeof s, "%d%%", done * 100 / total);
+    int tw = (int)strlen(s) * GLYPH_W;
+    st7789_fill_rect((LCD_W - 48) / 2, ybar - 24, 48, 10, bg);
+    st7789_draw_string((LCD_W - tw) / 2, ybar - 24, s, txc, bg, 1);
+
+    prev_px = px;
+    if (done >= total) prev_px = -1;                     // reset for the next load
+}
+
 void ui_draw_menu(const menu_t *m) {
     ui_fill_bg(0, HDR_H, LCD_W, LCD_H - HDR_H - FTR_H);
     if (m->logo) ui_header_logo(m->title);
@@ -166,12 +249,13 @@ void ui_draw_menu(const menu_t *m) {
         bool selected = (i == m->sel);
         uint16_t bg = selected ? g_theme->sel_bg : g_theme->bg;
         uint16_t fg = selected ? g_theme->sel_fg : g_theme->item_fg;
-        if (selected) ui_fill_pill(8, y - 4, LCD_W - 16, ROW_H - 4, bg);
-        char line[96];
-        snprintf(line, sizeof line, "%s %s", selected ? ">" : " ", m->items[i]);
-        st7789_draw_string(16, y + 2, line, fg, bg, 2);
+        if (selected) {
+            ui_fill_pill(8, y - 4, LCD_W - 16, ROW_H - 4, bg);
+            st7789_fill_rect(11, y - 1, 3, ROW_H - 10, g_theme->sel_fg);  // left accent stripe
+        }
+        st7789_draw_string(22, y + 2, m->items[i], fg, bg, 2);
     }
-    ui_footer("UP/DOWN move   A select   B back");
+    ui_footer("^v move   A select   B back");
 }
 
 bool ui_menu_move(menu_t *m, int delta) {

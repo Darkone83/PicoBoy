@@ -8,6 +8,7 @@ typedef struct {
     uint8_t palette;         // 0 = auto (per-game color), 1..13 = manual preset
     int8_t  frameskip;       // -1 = auto (show when ready), 0..5 = fixed frames skipped
     uint8_t theme;           // index into the built-in theme table (theme.h)
+    uint8_t screensaver;     // 0 = off, 1 = on (idle animation on the menus)
 } settings_t;
 
 extern settings_t g_settings;

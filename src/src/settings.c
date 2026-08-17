@@ -15,7 +15,7 @@ settings_t g_settings;
 
 // ---------- NVS (top 4 KB sector) ----------
 #define NVS_MAGIC   0x59424F50u   // 'PBOY'
-#define NVS_VERSION 3u
+#define NVS_VERSION 4u
 
 typedef struct {
     uint32_t   magic;
@@ -33,6 +33,7 @@ static void settings_defaults(void) {
     g_settings.palette        = 0;    // auto per-game color
     g_settings.frameskip      = -1;   // auto
     g_settings.theme          = 0;    // first built-in theme (Purple)
+    g_settings.screensaver    = 1;    // idle animation on by default
 }
 
 void settings_init(void) {
@@ -47,6 +48,7 @@ void settings_init(void) {
         if (g_settings.palette > 13)         g_settings.palette = 0;
         if (g_settings.frameskip < -1)       g_settings.frameskip = -1;
         if (g_settings.frameskip > 5)        g_settings.frameskip = 5;
+        if (g_settings.screensaver > 1)      g_settings.screensaver = 1;
     } else {
         settings_defaults();   // first boot / erased / version mismatch
     }
@@ -147,7 +149,7 @@ static void flash_ops_menu(void) {
 }
 
 // ---------- Settings menu (mixed value + action items) ----------
-typedef enum { IT_VALUE, IT_ACTION, IT_CHOICE } itk_t;
+typedef enum { IT_VALUE, IT_ACTION, IT_CHOICE, IT_TOGGLE } itk_t;
 typedef struct {
     const char *label;
     itk_t       kind;
@@ -156,7 +158,7 @@ typedef struct {
     void      (*action)(void);  // IT_ACTION
 } item_t;
 
-#define N_ITEMS 6
+#define N_ITEMS 7
 static item_t items[N_ITEMS];
 
 static void build_items(void) {
@@ -164,8 +166,9 @@ static void build_items(void) {
     items[1] = (item_t){ "LED Bright",  IT_VALUE,  &g_settings.led_brightness, 0,  NULL };
     items[2] = (item_t){ "Volume",      IT_VALUE,  &g_settings.volume,         0,  NULL };
     items[3] = (item_t){ "Theme",       IT_CHOICE, &g_settings.theme,          0,  NULL };
-    items[4] = (item_t){ "Flash Ops",   IT_ACTION, NULL, 0, flash_ops_menu };
-    items[5] = (item_t){ "Diagnostics", IT_ACTION, NULL, 0, diagnostics_menu };
+    items[4] = (item_t){ "Screensaver", IT_TOGGLE, &g_settings.screensaver,    0,  NULL };
+    items[5] = (item_t){ "Flash Ops",   IT_ACTION, NULL, 0, flash_ops_menu };
+    items[6] = (item_t){ "Diagnostics", IT_ACTION, NULL, 0, diagnostics_menu };
 }
 
 static void draw(int sel) {
@@ -181,6 +184,8 @@ static void draw(int sel) {
             snprintf(body, sizeof body, "%-11s %3u", items[i].label, (unsigned)*items[i].val);
         else if (items[i].kind == IT_CHOICE)
             snprintf(body, sizeof body, "%-11s %s", items[i].label, theme_name((int)*items[i].val));
+        else if (items[i].kind == IT_TOGGLE)
+            snprintf(body, sizeof body, "%-11s %s", items[i].label, *items[i].val ? "On" : "Off");
         else
             snprintf(body, sizeof body, "%-11s   >", items[i].label);
         snprintf(line, sizeof line, "%c %s", on ? '>' : ' ', body);
@@ -210,6 +215,10 @@ void settings_menu(void) {
             if (ev & (1u << BTN_LEFT))  nv = (cur - 1 + n) % n;
             if (ev & (1u << BTN_RIGHT)) nv = (cur + 1) % n;
             if (nv != cur) { *it->val = (uint8_t)nv; theme_select(nv); led_set_idle_rgb565(g_theme->accent); changed = true; }
+        } else if (it->kind == IT_TOGGLE) {
+            if ((ev & (1u << BTN_LEFT))  &&  *it->val) { *it->val = 0; changed = true; }
+            if ((ev & (1u << BTN_RIGHT)) && !*it->val) { *it->val = 1; changed = true; }
+            if (ev & (1u << BTN_A))                    { *it->val = !*it->val; changed = true; }
         } else { // IT_VALUE
             if (ev & (1u << BTN_LEFT))  { int nv = (int)*it->val - 5; if (nv < it->vmin) nv = it->vmin; *it->val = (uint8_t)nv; changed = true; }
             if (ev & (1u << BTN_RIGHT)) { int nv = (int)*it->val + 5; if (nv > 100)      nv = 100;      *it->val = (uint8_t)nv; changed = true; }

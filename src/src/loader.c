@@ -254,7 +254,7 @@ static bool flash_from_sd(const char *path) {
 
     led_set_state(LED_FLASH_BUSY);
     s_secbuf = arena_base();                   // borrow the arena for staging (no core running)
-    st7789_fill(COL_BLACK);
+    st7789_fill(g_theme->bg);
     ui_header("Loading ROM");
     ui_footer("");
 
@@ -268,12 +268,7 @@ static bool flash_from_sd(const char *path) {
         flash_erase_sector(ROM_FLASH_OFFSET + off);
         for (uint32_t p = 0; p < FLASH_SECTOR_SIZE; p += FLASH_PAGE_SIZE)
             flash_program_page(ROM_FLASH_OFFSET + off + p, s_secbuf + p);
-        if ((++done & 0x07) == 0 || done == total) {
-            char line[24];
-            snprintf(line, sizeof line, "Flashing... %lu%%", (unsigned long)(done * 100u / total));
-            st7789_fill_rect(12, 90, 300, 14, COL_BLACK);
-            st7789_draw_string(12, 90, line, COL_WHITE, COL_BLACK, 1);
-        }
+        ui_progress_pacman((int)(++done), (int)total);
     }
     f_close(&fil);
 

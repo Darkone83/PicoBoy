@@ -101,7 +101,16 @@ bool snd_tone(uint32_t hz, uint32_t ms) {
 // frames per buffer); InfoNES also runs 44100 Hz, and ~735 samples/NES-frame
 // vs the 738-frame buffer is a continuous stream with no pitch error.
 
-#define NES_AUDIO_HEADROOM 0         // >>2 on the mono mix; lower = louder
+// NES makeup gain, applied AFTER DC removal (below). The InfoNES mix is unipolar
+// (0..~41565, big DC offset) the amp cannot reproduce, and its AC content is
+// low-amplitude -- so we high-pass to centre at 0, then apply a healthy gain.
+// Peaks are soft-clipped (nes_soft_clip) rather than hard-clamped, so you can
+// push this well past unity without harshness. Raise NUM to taste vs GB.
+#define NES_AUDIO_GAIN_NUM 4
+#define NES_AUDIO_GAIN_DEN 1
+
+static int s_nes_px = 0;   // DC-blocker: previous input
+static int s_nes_hp = 0;   // DC-blocker: previous output
 
 static int16_t  s_nesbuf[SND_FRAMES * 2];   // one I2S buffer, stereo L/R
 static unsigned s_nesfill = 0;                 // stereo frames accumulated
@@ -109,11 +118,25 @@ static unsigned s_nesfill = 0;                 // stereo frames accumulated
 void snd_nes_open(void) {
     snd_init();                       // shared I2S up (idempotent)
     s_nesfill = 0;
+    s_nes_px = s_nes_hp = 0;          // reset the DC blocker for the new game
 }
 
 int snd_nes_room(void) {
     if (!s_inited) return 0;
     return (int)(SND_FRAMES - s_nesfill);
+}
+
+// Soft clip to +/-32767: linear up to THR, then a smooth knee that asymptotes to
+// full scale (never exceeds it). Lets the gain be pushed hard without the harsh
+// edge of hard clipping.
+static int nes_soft_clip(int x) {
+    const int THR = 22000, LIM = 32767, HR = LIM - THR;
+    int neg = x < 0, ax = neg ? -x : x;
+    if (ax > THR) {
+        int over = ax - THR;
+        ax = THR + (int)(((long long)over * HR) / (over + HR));
+    }
+    return neg ? -ax : ax;
 }
 
 void snd_nes_output(int n, const uint8_t *w1, const uint8_t *w2, const uint8_t *w3,
@@ -128,9 +151,16 @@ void snd_nes_output(int n, const uint8_t *w1, const uint8_t *w2, const uint8_t *
             int a6 = w6 ? w6[i] : 0;
             int l = a1 * 6 + a2 * 3 + a3 * 5 + a4 * 51 + a5 * 80 + a6 * 18;
             int r = a1 * 3 + a2 * 6 + a3 * 5 + a4 * 51 + a5 * 80 + a6 * 18;
-            int mono = (l + r) >> 1;
-            s = ((mono * vol) / 100) >> NES_AUDIO_HEADROOM;
-            if (s > 32767) s = 32767;             // mix is unipolar (>= 0)
+            int mono = (l + r) >> 1;              // 0..~41565, unipolar (DC-offset)
+
+            // DC blocker (one-pole high-pass, R~0.996 / fc~28 Hz): recentre at 0
+            // so the amp reproduces the full swing, not a DC pedestal it eats.
+            int hp = mono - s_nes_px + (s_nes_hp - (s_nes_hp >> 8));
+            s_nes_px = mono;
+            s_nes_hp = hp;
+
+            int v = ((hp * vol) / 100) * NES_AUDIO_GAIN_NUM / NES_AUDIO_GAIN_DEN;
+            s = nes_soft_clip(v);                 // graceful saturation, not hard clip
         }
         s_nesbuf[s_nesfill * 2]     = (int16_t)s;
         s_nesbuf[s_nesfill * 2 + 1] = (int16_t)s; // mono -> both channels
