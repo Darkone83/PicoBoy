@@ -55,7 +55,7 @@ void settings_init(void) {
     if (g_settings.theme >= (uint8_t)theme_count()) g_settings.theme = 0;
     theme_select(g_settings.theme);               // activate before any UI is drawn
     led_set_idle_rgb565(g_theme->accent);         // static idle colour follows accent
-    led_set_idle_trans_cycle(g_theme->led_mode == THEME_LED_TRANS_CYCLE);
+    led_set_idle_theme_mode(g_theme->led_mode);
 }
 
 void settings_save(void) {
@@ -76,7 +76,7 @@ void settings_apply(void) {
     // means Reset Settings immediately restores the default theme/LED behavior.
     theme_select(g_settings.theme);
     led_set_idle_rgb565(g_theme->accent);
-    led_set_idle_trans_cycle(g_theme->led_mode == THEME_LED_TRANS_CYCLE);
+    led_set_idle_theme_mode(g_theme->led_mode);
     st7789_backlight_level(g_settings.lcd_brightness);
     ws2812_set_brightness(g_settings.led_brightness);  // animator re-applies colour at this level
 }
@@ -137,7 +137,7 @@ static void reset_settings(void) {
 
 static void flash_ops_menu(void) {
     static const char *const items[] = { "Clear ROM", "Reset Settings" };
-    menu_t m = { "Flash Ops", items, 2, 0, false };
+    menu_t m = { "Flash Ops", items, 2, 0 };
     ui_draw_menu(&m);
     while (true) {
         buttons_update();
@@ -215,13 +215,7 @@ void settings_menu(void) {
 
         item_t *it = &items[sel];
         if (it->kind == IT_ACTION) {
-            if (ev & (1u << BTN_A)) {
-                ui_transition(UI_TRANSITION_FORWARD);
-                it->action();
-                ui_transition(UI_TRANSITION_BACK);
-                draw(sel);
-                continue;
-            }
+            if (ev & (1u << BTN_A)) { it->action(); draw(sel); continue; }
         } else if (it->kind == IT_CHOICE) {
             int n = theme_count(), cur = (int)*it->val, nv = cur;
             if (ev & (1u << BTN_LEFT))  nv = (cur - 1 + n) % n;

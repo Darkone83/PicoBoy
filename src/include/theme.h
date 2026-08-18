@@ -15,7 +15,11 @@
 // still take priority; this only changes the normal LED_IDLE presentation.
 typedef enum {
     THEME_LED_STATIC = 0,      // idle LED follows the theme accent
-    THEME_LED_TRANS_CYCLE,     // smooth blue -> pink -> white -> pink -> blue cycle
+    THEME_LED_TRANS_CYCLE,     // blue -> pink -> white -> pink -> blue
+    THEME_LED_DMG_CYCLE,       // four classic LCD-green shades
+    THEME_LED_NES_CYCLE,       // red -> gray -> white -> gray -> red
+    THEME_LED_ARCADE_CYCLE,    // cyan -> magenta -> yellow -> green -> cyan
+    THEME_LED_PICO_CYCLE,      // raspberry -> white -> green -> white -> raspberry
 } theme_led_mode_t;
 
 // Semantic colour roles. The UI chrome asks the active theme for colours by

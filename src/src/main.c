@@ -131,6 +131,37 @@ static void about_screen(void) {
     }
 }
 
+
+#define BOOT_LED_FADE_MS     1600u
+#define BOOT_LED_FADE_STEPS   100u
+
+// Fixed-rate smoothstep fade. The old loop made one brightness step per percent,
+// so a low configured LED brightness could sit ~50-80 ms between visible steps.
+// This keeps the timing cadence constant and eases both ends of the ramp.
+static void boot_led_fade(uint8_t target) {
+    const uint32_t frame_ms = BOOT_LED_FADE_MS / BOOT_LED_FADE_STEPS;
+
+    if (target == 0) {
+        ws2812_set_brightness(0);
+        sleep_ms(BOOT_LED_FADE_MS);
+        return;
+    }
+
+    for (uint32_t i = 0; i <= BOOT_LED_FADE_STEPS; i++) {
+        // t is 0..1024. smoothstep(t) = 3t^2 - 2t^3.
+        uint32_t t = (i * 1024u) / BOOT_LED_FADE_STEPS;
+        uint32_t eased = (uint32_t)(
+            ((uint64_t)t * t * (3072u - 2u * t) + 524288u) / 1048576u
+        );                                              // 0..1024
+
+        uint8_t b = (uint8_t)(((uint32_t)target * eased + 512u) / 1024u);
+        ws2812_set_brightness(b);
+
+        if (i != BOOT_LED_FADE_STEPS)
+            sleep_ms(frame_ms);
+    }
+}
+
 int main(void) {
     overclock();
     stdio_init_all();
@@ -147,10 +178,7 @@ int main(void) {
 
     settings_init();                             // need the LED-brightness target
     uint8_t led_t = g_settings.led_brightness;   // final level to fade up to
-    for (int b = 0; b <= led_t; b++) {           // ~1.6 s fade (or just hold if LED off)
-        ws2812_set_brightness((uint8_t)b);
-        sleep_ms(led_t ? 1600 / led_t : 1600);
-    }
+    boot_led_fade(led_t);                        // ~1.6 s eased, fixed-cadence ramp
 
     buttons_init();
     settings_apply();          // backlight + LED brightness (settles at the target)

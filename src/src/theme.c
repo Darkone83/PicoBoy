@@ -70,7 +70,33 @@ static const theme_t THEMES[] = {
       RGB565( 15,  56,  15), RGB565( 48,  98,  48), RGB565(224, 248, 208),
       RGB565(155, 188,  15), RGB565( 15,  56,  15), RGB565(139, 172,  15),
       RGB565(139, 172,  15), RGB565(155, 188,  15), RGB565( 15,  56,  15),
-      RGB565(155, 188,  15), RGB565(224, 200,  40), RGB565(224, 120,  40), THEME_LED_STATIC },
+      RGB565(155, 188,  15), RGB565(224, 200,  40), RGB565(224, 120,  40), THEME_LED_DMG_CYCLE },
+
+    // NES-controller inspired: charcoal shell, warm light gray, and red accent.
+    { "NES",
+      RGB565( 12,  12,  14), RGB565( 72,  72,  78), RGB565(248, 248, 248),
+      RGB565(214,  44,  52), RGB565( 34,  34,  38), RGB565(184, 184, 190),
+      RGB565(228, 228, 232), RGB565(214,  44,  52), RGB565(255, 255, 255),
+      RGB565( 96, 210, 132), RGB565(244, 202,  86), RGB565(244,  86,  86),
+      THEME_LED_NES_CYCLE },
+
+    // Loud cabinet-neon palette. Kept on a black base so the saturated accent
+    // colours feel deliberate rather than making the whole UI visually noisy.
+    { "Arcade",
+      RGB565(  0,   0,   0), RGB565( 62,  18,  86), RGB565(255, 255, 255),
+      RGB565( 32, 224, 236), RGB565( 24,   8,  34), RGB565(220, 170, 232),
+      RGB565(240, 236, 248), RGB565(232,  46, 188), RGB565(255, 255, 255),
+      RGB565( 64, 232, 132), RGB565(255, 224,  64), RGB565(255,  78,  96),
+      THEME_LED_ARCADE_CYCLE },
+
+    // Raspberry Pi / Pico nod: raspberry accent with restrained green secondary
+    // tones over a nearly-black blue-gray base.
+    { "Pico",
+      RGB565(  4,   8,  12), RGB565(104,  20,  48), RGB565(255, 255, 255),
+      RGB565(198,  30,  76), RGB565( 16,  28,  22), RGB565(172, 210, 180),
+      RGB565(232, 238, 234), RGB565(198,  30,  76), RGB565(255, 255, 255),
+      RGB565(112, 190,  62), RGB565(246, 204,  80), RGB565(244,  86,  96),
+      THEME_LED_PICO_CYCLE },
 
     // Hot pink over a deep plum/black base: bright and playful without turning
     // every surface into full-intensity pink (which would crush readability).
