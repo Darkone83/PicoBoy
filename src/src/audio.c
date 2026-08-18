@@ -20,6 +20,10 @@ static bool s_inited = false;
 // Recompute the identical value (738) with integer math for the buffer dimension.
 #define SND_FRAMES   ((AUDIO_SAMPLE_RATE * 70224u) / 4194304u)   // == AUDIO_SAMPLES
 
+// Only one emulator runs at a time. GB, NES and Atari therefore share one
+// stereo PCM staging buffer instead of each reserving ~3 KB of BSS.
+static int16_t s_pcmbuf[SND_FRAMES * 2];
+
 void snd_init(void) {
     if (s_inited) return;
     s_cfg = i2s_get_default_config();
@@ -44,28 +48,27 @@ void snd_apu_reset(void) {
 #define GB_AUDIO_HEADROOM 1
 
 bool snd_play_frame(void) {
-    static int16_t smp[SND_FRAMES * 2];           // stereo interleaved L,R
     if (!s_inited) return false;
 
-    audio_callback(NULL, smp, AUDIO_BUFFER_SIZE_BYTES);
+    audio_callback(NULL, s_pcmbuf, AUDIO_BUFFER_SIZE_BYTES);
 
     uint8_t vol = g_settings.volume;              // 0..100 (%)
     if (vol == 0) {
-        memset(smp, 0, sizeof smp);               // mute -- DMA still runs to keep I2S clocked
+        memset(s_pcmbuf, 0, sizeof s_pcmbuf);               // mute -- DMA still runs to keep I2S clocked
     } else {
         // minigb_apu output is hot. GB_AUDIO_HEADROOM is the attenuation shift that
         // rides under the 0-100% Volume setting: 2 = Pico-GB quiet default (-12 dB),
         // 1 = ~2x louder (-6 dB), 0 = full scale (loudest; peaks may sound harsh).
         for (unsigned i = 0; i < SND_FRAMES * 2; i++) {
-            int32_t v = (((int32_t)smp[i] * vol) / 100) >> GB_AUDIO_HEADROOM;
+            int32_t v = (((int32_t)s_pcmbuf[i] * vol) / 100) >> GB_AUDIO_HEADROOM;
             if (v >  32767) v =  32767;           // safety clamp (also covers future boost)
             if (v < -32768) v = -32768;
-            smp[i] = (int16_t)v;
+            s_pcmbuf[i] = (int16_t)v;
         }
     }
 
     s_cfg.dma_trans_count = AUDIO_SAMPLES;        // GB count (NES may have changed it)
-    i2s_dma_write(&s_cfg, smp);   // waits for the previous buffer to finish draining,
+    i2s_dma_write(&s_cfg, s_pcmbuf);   // waits for the previous buffer to finish draining,
     return true;                  // so this call paces the loop to the exact 44100 Hz rate
 }
 
@@ -112,7 +115,6 @@ bool snd_tone(uint32_t hz, uint32_t ms) {
 static int s_nes_px = 0;   // DC-blocker: previous input
 static int s_nes_hp = 0;   // DC-blocker: previous output
 
-static int16_t  s_nesbuf[SND_FRAMES * 2];   // one I2S buffer, stereo L/R
 static unsigned s_nesfill = 0;                 // stereo frames accumulated
 
 void snd_nes_open(void) {
@@ -166,8 +168,8 @@ void snd_nes_output(int n, const uint8_t *w1, const uint8_t *w2, const uint8_t *
             int v = ((hp * vol) / 100) * NES_AUDIO_GAIN_NUM / NES_AUDIO_GAIN_DEN;
             s = nes_soft_clip(v);                 // graceful saturation, not hard clip
         }
-        s_nesbuf[s_nesfill * 2]     = (int16_t)s;
-        s_nesbuf[s_nesfill * 2 + 1] = (int16_t)s; // mono -> both channels
+        s_pcmbuf[s_nesfill * 2]     = (int16_t)s;
+        s_pcmbuf[s_nesfill * 2 + 1] = (int16_t)s; // mono -> both channels
         s_nesfill++;
     }
 }
@@ -179,8 +181,116 @@ void snd_nes_output(int n, const uint8_t *w1, const uint8_t *w2, const uint8_t *
 void snd_nes_flush(void) {
     if (!s_inited || s_nesfill == 0) return;
     s_cfg.dma_trans_count = s_nesfill;            // this frame's exact sample count
-    i2s_dma_write(&s_cfg, s_nesbuf);              // blocks on prior DMA -> paces
+    i2s_dma_write(&s_cfg, s_pcmbuf);              // blocks on prior DMA -> paces
     s_nesfill = 0;
 }
 
 void snd_nes_close(void) { s_nesfill = 0; }
+
+// ---------------------------------------------------------------------------
+// Atari 2600 TIA audio.
+// The TIA core now integrates its channel DAC levels over real colour-clock
+// time and supplies an anti-aliased, nonlinear-mixed 0..32767 sample at 44.1
+// kHz. This layer only AC-couples, applies Volume, and feeds the shared I2S DMA.
+// Audio remains continuous/fixed-block rather than frame-sized.
+
+static unsigned s_atari_fill = 0;
+static bool     s_atari_block_queued = false;
+static bool     s_atari_filter_seeded = false;
+static int      s_atari_px = 0;
+static int      s_atari_hp = 0;
+
+// Continuous DMA blocks: ~11.6 ms at 44.1 kHz.  The previous 256-sample
+// block doubled the number of DMA hand-offs while the emulator was still just
+// shy of real time.  512 remains below the I2S driver's 738-frame allocation,
+// cuts hand-off overhead in half, and gives the producer more jitter margin.
+#define ATARI_AUDIO_BLOCK 512u
+
+static void atari_write_block(void) {
+    if (!s_inited || s_atari_fill == 0)
+        return;
+
+    s_cfg.dma_trans_count = s_atari_fill;
+    i2s_dma_write(&s_cfg, s_pcmbuf);
+    s_atari_fill = 0;
+    s_atari_block_queued = true;
+}
+
+void snd_atari_open(void) {
+    snd_init();
+    s_atari_fill = 0;
+    s_atari_block_queued = false;
+    s_atari_filter_seeded = false;
+    s_atari_px = 0;
+    s_atari_hp = 0;
+}
+
+void snd_atari_sample(uint16_t level) {
+    if (!s_inited)
+        return;
+
+    if (level > 32767u)
+        level = 32767u;
+
+    if (s_atari_fill >= ATARI_AUDIO_BLOCK)
+        atari_write_block();
+
+    // The TIA core now supplies native phase-clock-averaged samples and applies
+    // the nonlinear two-channel mixer.  This layer only performs the output
+    // AC coupling and user volume.  Do not add makeup gain here: sharpening the
+    // source cadence, rather than boosting/clipping it, is the audio fix.
+    int raw = (int)level;
+    int hp;
+
+    if (!s_atari_filter_seeded) {
+        // Start the high-pass at the current DC level instead of generating a
+        // full-scale startup transient.
+        s_atari_px = raw;
+        s_atari_hp = 0;
+        s_atari_filter_seeded = true;
+        hp = 0;
+    } else {
+        hp = raw - s_atari_px + (s_atari_hp - (s_atari_hp >> 8));
+        s_atari_px = raw;
+        s_atari_hp = hp;
+    }
+
+    int sample = 0;
+    const uint8_t vol = g_settings.volume;
+    if (vol) {
+        int v = (hp * (int)vol) / 100;
+
+        // Final integer-range safety only; there is no normal-path compressor
+        // or makeup stage.
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        sample = v;
+    }
+
+    s_pcmbuf[s_atari_fill * 2]     = (int16_t)sample;
+    s_pcmbuf[s_atari_fill * 2 + 1] = (int16_t)sample;
+    s_atari_fill++;
+
+    if (s_atari_fill >= ATARI_AUDIO_BLOCK)
+        atari_write_block();
+}
+
+bool snd_atari_flush(void) {
+    if (!s_inited)
+        return false;
+
+    if (s_atari_fill)
+        atari_write_block();
+
+    bool queued = s_atari_block_queued;
+    s_atari_block_queued = false;
+    return queued;
+}
+
+void snd_atari_close(void) {
+    s_atari_fill = 0;
+    s_atari_block_queued = false;
+    s_atari_filter_seeded = false;
+    s_atari_px = 0;
+    s_atari_hp = 0;
+}

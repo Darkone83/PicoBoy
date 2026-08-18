@@ -56,6 +56,11 @@ add_executable(picoboy
     src/infones_fds.cpp
     src/theme.c
     src/battery.c
+    src/atari_core.c
+    src/atari_cart.c
+    src/atari_cpu.c
+    src/atari_riot.c
+    src/atari_tia.c
 )
 
 # NOTE: third_party/peanut-gb/peanut_gb.h is vendored but intentionally NOT

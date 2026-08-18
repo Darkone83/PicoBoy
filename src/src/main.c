@@ -109,29 +109,161 @@ static void screensaver_run(void) {
     st7789_backlight_level(g_settings.lcd_brightness);   // restore on wake
 }
 
-// Simple About screen: name, version, credits, license. Reachable from the menu.
+// About / credits -----------------------------------------------------------
+// Keep these credits in the firmware as well as the repository documentation.
+// PicoBoy's emulator cores are heavily adapted for this hardware, but the
+// upstream projects and authors remain an important part of the lineage.
+typedef struct {
+    const char *text;
+    uint8_t style;    // 0 = normal, 1 = section/accent, 2 = dim
+} about_credit_t;
+
+static const about_credit_t ABOUT_CREDITS[] = {
+    { "GAME BOY",                         1 },
+    { "Peanut-GB + minigb_apu",           0 },
+    { "Mahyar Koshkouei / deltabeard",    0 },
+    { "MIT licensed",                     2 },
+    { "",                                 0 },
+
+    { "NES",                              1 },
+    { "InfoNES - Jay Kumogata",           0 },
+    { "pico-infones - Shuichi Takano",    0 },
+    { "pico-infonesPlus - fhoedemakers",  0 },
+    { "",                                 0 },
+
+    { "ATARI 2600",                       1 },
+    { "pico-atari2600",                   0 },
+    { "Ilya Maslennikov - MIT",           0 },
+    { "Based on HiFive1-2600",            0 },
+    { "David Grubb",                      0 },
+    { "Accuracy reference: Stella project", 2 },
+    { "",                                 0 },
+
+    { "PLATFORM / LIBRARIES",             1 },
+    { "FatFs - ChaN",                     0 },
+    { "I2S - Vincent Mistler",            0 },
+    { "Raspberry Pi Pico SDK",            0 },
+    { "",                                 0 },
+    { "PicoBoy firmware: GPL-3.0",        2 },
+};
+
+#define ABOUT_CREDIT_COUNT \
+    ((int)(sizeof(ABOUT_CREDITS) / sizeof(ABOUT_CREDITS[0])))
+#define ABOUT_VISIBLE_LINES 9
+#define ABOUT_LIST_X        14
+#define ABOUT_LIST_Y       105
+#define ABOUT_LINE_H        11
+#define ABOUT_LIST_H       (ABOUT_VISIBLE_LINES * ABOUT_LINE_H)
+
+static void about_draw_credit_list(int top) {
+    uint16_t bg  = g_theme->bg;
+    uint16_t tx  = g_theme->item_fg;
+    uint16_t dim = g_theme->footer_fg;
+    uint16_t ac  = g_theme->accent;
+
+    // Clear just the scrolling body; title/version above it stay fixed.
+    st7789_fill_rect(8, ABOUT_LIST_Y - 3, LCD_W - 16, ABOUT_LIST_H + 6, bg);
+
+    for (int row = 0; row < ABOUT_VISIBLE_LINES; row++) {
+        int i = top + row;
+        if (i >= ABOUT_CREDIT_COUNT) break;
+
+        uint16_t col = ABOUT_CREDITS[i].style == 1 ? ac
+                     : ABOUT_CREDITS[i].style == 2 ? dim
+                     : tx;
+
+        st7789_draw_string(ABOUT_LIST_X,
+                           ABOUT_LIST_Y + row * ABOUT_LINE_H,
+                           ABOUT_CREDITS[i].text,
+                           col, bg, 1);
+    }
+
+    // Thin themed scrollbar. It also makes it obvious there is more text below.
+    if (ABOUT_CREDIT_COUNT > ABOUT_VISIBLE_LINES) {
+        const int track_x = LCD_W - 7;
+        const int track_y = ABOUT_LIST_Y - 2;
+        const int track_h = ABOUT_LIST_H + 2;
+        const int max_top = ABOUT_CREDIT_COUNT - ABOUT_VISIBLE_LINES;
+
+        int thumb_h = track_h * ABOUT_VISIBLE_LINES / ABOUT_CREDIT_COUNT;
+        if (thumb_h < 12) thumb_h = 12;
+
+        int thumb_y = track_y;
+        if (max_top > 0)
+            thumb_y += (track_h - thumb_h) * top / max_top;
+
+        st7789_fill_rect(track_x, track_y, 3, track_h, g_theme->footer_bg);
+        st7789_fill_rect(track_x, thumb_y, 3, thumb_h, ac);
+    }
+}
+
+// Scrollable About screen. Up/Down moves one line; Left/Right pages.
+// B returns to the main menu.
 static void about_screen(void) {
-    uint16_t ac = g_theme->accent, tx = g_theme->item_fg, bg = g_theme->bg, dim = g_theme->footer_fg;
+    uint16_t ac  = g_theme->accent;
+    uint16_t tx  = g_theme->item_fg;
+    uint16_t bg  = g_theme->bg;
+    uint16_t dim = g_theme->footer_fg;
+
     st7789_fill(bg);
     ui_header("About");
-    int x = 14, y = 44;
-    st7789_draw_string(x, y, "PicoBoy", ac, bg, 2);                 y += 24;
-    st7789_draw_string(x, y, "Version " PICOBOY_VERSION, tx, bg, 1); y += 13;
-    st7789_draw_string(x, y, "by Darkone83", tx, bg, 1);            y += 20;
-    st7789_draw_string(x, y, "Emulator cores", dim, bg, 1);         y += 13;
-    st7789_draw_string(x, y, "GB  Peanut-GB - deltabeard", tx, bg, 1); y += 12;
-    st7789_draw_string(x, y, "NES InfoNES - kumogata", tx, bg, 1);     y += 12;
-    st7789_draw_string(x, y, "SD  FatFs - ChaN", tx, bg, 1);           y += 20;
-    st7789_draw_string(x, y, "License  GPL-3.0", tx, bg, 1);         y += 13;
-    ui_footer("B back");
+
+    st7789_draw_string(14, 40, "PicoBoy", ac, bg, 2);
+    st7789_draw_string(146, 43, "Version " PICOBOY_VERSION, tx, bg, 1);
+    st7789_draw_string(14, 69, "by Darkone83", tx, bg, 1);
+    st7789_draw_string(14, 88, "Third-party credits", dim, bg, 1);
+
+    int top = 0;
+    about_draw_credit_list(top);
+    ui_footer("Up/Down scroll   B back");
+
     while (true) {
         buttons_update();
-        if (buttons_pressed() & (1u << BTN_B)) break;
+        uint16_t ev = buttons_pressed();
+        bool redraw = false;
+
+        if (ev & (1u << BTN_B))
+            break;
+
+        if ((ev & (1u << BTN_UP)) && top > 0) {
+            top--;
+            redraw = true;
+        }
+
+        if ((ev & (1u << BTN_DOWN)) &&
+            top < ABOUT_CREDIT_COUNT - ABOUT_VISIBLE_LINES) {
+            top++;
+            redraw = true;
+        }
+
+        if (ev & (1u << BTN_LEFT)) {
+            int next = top - ABOUT_VISIBLE_LINES;
+            if (next < 0) next = 0;
+            if (next != top) {
+                top = next;
+                redraw = true;
+            }
+        }
+
+        if (ev & (1u << BTN_RIGHT)) {
+            int max_top = ABOUT_CREDIT_COUNT - ABOUT_VISIBLE_LINES;
+            int next = top + ABOUT_VISIBLE_LINES;
+            if (next > max_top) next = max_top;
+            if (next != top) {
+                top = next;
+                redraw = true;
+            }
+        }
+
+        if (redraw)
+            about_draw_credit_list(top);
+
         sleep_ms(15);
     }
 }
 
 
+// Smooth boot LED ramp used by the current 1.0.x UI.
 #define BOOT_LED_FADE_MS     1600u
 #define BOOT_LED_FADE_STEPS   100u
 

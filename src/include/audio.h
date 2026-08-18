@@ -34,3 +34,13 @@ void snd_nes_output(int n, const uint8_t *w1, const uint8_t *w2, const uint8_t *
                     const uint8_t *w4, const uint8_t *w5, const uint8_t *w6);
 void snd_nes_flush(void);
 void snd_nes_close(void);
+
+
+// --- Atari 2600 TIA audio -> shared I2S ------------------------------------
+// atari_tia integrates/anti-aliases the two DAC channels on the colour-clock
+// timeline and supplies a nonlinear-mixed unsigned 16-bit level at 44.1 kHz.
+// This layer AC-couples, scales by Volume, and queues fixed DMA blocks.
+void snd_atari_open(void);
+void snd_atari_sample(uint16_t level);  // nonlinear TIA mix, 0..32767
+bool snd_atari_flush(void);             // drain a partial block at pause/exit
+void snd_atari_close(void);

@@ -4,7 +4,7 @@
    <img src="https://github.com/Darkone83/PicoBoy/blob/main/images/Darkone83.png" width=400><img src="https://github.com/Darkone83/PicoBoy/blob/main/images/Picoboy.jpg" width=400>
 </div>
 
-A tiny handheld that plays **Game Boy** and **NES** games, built around a bare
+A tiny handheld that plays **Game Boy**, **NES**, and **Atari 2600** games, built around a bare
 RP2040. Load ROMs from a microSD card, keep your saves, pick your palette, and
 carry it in a pocket.
 
@@ -19,9 +19,10 @@ carry it in a pocket.
 
 ## Features
 
-- **Game Boy (DMG) and NES** games, loaded from microSD
-- **Battery saves** and **save states**
-- **In-game menu** — pause, brightness, volume, palette, frame-skip, save/load, quit
+- **Game Boy (DMG), NES, and Atari 2600** games, loaded from microSD
+- **Battery saves** and **save states** for supported Game Boy / NES titles
+- **In-game menu** — pause, brightness, volume, frame-skip, system-specific options, quit
+- **Atari 2600 NTSC emulation** — `.a26` / `.bin`, 2K, 4K, F8, F6, F4, and Superchip variants
 - **Selectable colour palettes** for Game Boy games
 - **On-screen battery meter** with charging, full, and low-battery states
 - **Themeable UI**
@@ -70,17 +71,17 @@ SD card root
 ├── roms/
 │   ├── gb/     <- Game Boy ROMs  (.gb)
 │   ├── nes/    <- NES ROMs       (.nes)
+│   ├── 2600/   <- Atari 2600     (.a26, .bin)
 │   └── fc/     <- Famicom        (.nes, not playable yet)
 ├── save/       <- battery saves  (created automatically)
 │   ├── gb/
 │   └── nes/
 └── state/      <- save states    (created automatically)
-    ├── gb/
-    └── nes/
+    └── gb/
 ```
 
-You only ever need to touch `roms/gb` and `roms/nes` — saves and states are
-written for you. (ROMs are not included; use games you legally own.)
+You only ever need to touch `roms/gb`, `roms/nes`, and `roms/2600` — saves and states are
+written for you where supported. (ROMs are not included; use games you legally own.)
 
 ---
 
@@ -177,7 +178,7 @@ That produces `game_rom.uf2`. Flash it the same way as the firmware (hold
 **BOOTSEL**, drag it onto **RPI-RP2**), then choose **Load last game**. The ROM
 lands in a separate area of flash from the firmware, so the two don't interfere.
 
-> This path is **Game Boy only**. NES games load from the SD card.
+> This path is **Game Boy only**. NES and Atari 2600 games load from the SD card.
 
 ---
 
@@ -201,10 +202,22 @@ attributions intact if you fork or redistribute.
 
 - **[Peanut-GB](https://github.com/deltabeard/Peanut-GB)** and
   **[minigb_apu](https://github.com/deltabeard/minigb_apu)** — Game Boy emulation
-  and audio, by deltabeard (Mahyar Koshkouei). MIT License. (Peanut-GB also
+  and audio, by deltabeard (Mahyar Koshkouei). **MIT License**. (Peanut-GB also
   incorporates palette data from the SameBoy project, MIT.)
 - **[InfoNES](https://github.com/jay-kumogata/InfoNES)** — NES emulation,
-  originally by Jay (kumogata). Freeware.
+  originally by Jay Kumogata. **Freeware**.
+- **[pico-infones](https://github.com/shuichitakano/pico-infones)** — Raspberry Pi
+  Pico port by Shuichi Takano. **GPL-3.0**.
+- **[pico-infonesPlus](https://github.com/fhoedemakers/pico-infonesPlus)** —
+  RP2040/RP2350 InfoNES work by Frank Hoedemakers used as part of PicoBoy's NES
+  port lineage. **GPL-3.0**.
+- **[pico-atari2600](https://github.com/xrip/pico-atari2600)** — Atari 2600
+  Raspberry Pi Pico emulator by Ilya Maslennikov. **MIT License**.
+- **[HiFive1-2600](https://github.com/dgrubb/HiFive1-2600)** — original embedded
+  6507 / TIA / RIOT emulator by David Grubb that pico-atari2600 was based on.
+- **[Stella](https://github.com/stella-emu/stella)** — Atari 2600 accuracy and
+  timing reference used while validating PicoBoy's adapted TIA/audio behavior.
+  Stella code is **not embedded in PicoBoy**; Stella is GPL-2.0-or-later.
 - **[FatFs](http://elm-chan.org/fsw/ff/)** — SD card filesystem, by ChaN.
   BSD-style license.
 - **I²S audio driver** — MAX98357 output, by Vincent Mistler (MIT), with the PIO
@@ -213,7 +226,7 @@ attributions intact if you fork or redistribute.
   Pi Ltd. BSD-3-Clause. (WS2812 LED PIO adapted from `pico-examples`.)
 
 Each third-party component retains its own license; see the respective project
-for full terms.
+for full terms. PicoBoy's own source is distributed under GPL-3.0.
 
 ---
 
