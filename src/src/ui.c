@@ -254,6 +254,15 @@ static void pac_draw_sprite(int cx, int cy, int frame) {
     // generic yellow disc.  It stays fixed across all mouth frames.
     st7789_fill_rect(x0 + 6 * PAC_SCALE, y0 + 3 * PAC_SCALE,
                      PAC_SCALE, PAC_SCALE, eye);
+
+    // Tiny Ms. Pac-Man-style easter egg for the Trans theme. The bow uses the
+    // theme accent, which is the flag pink in this theme.
+    if (g_theme->led_mode == THEME_LED_TRANS_CYCLE) {
+        uint16_t bow = g_theme->accent;
+        st7789_fill_rect(x0 + 2,  y0 - 4, 6, 4, bow);  // left loop
+        st7789_fill_rect(x0 + 10, y0 - 4, 6, 4, bow);  // right loop
+        st7789_fill_rect(x0 + 7,  y0 - 3, 4, 4, bow);  // knot
+    }
 }
 
 static void pac_draw_sparkle(int x, int y, uint16_t c) {
