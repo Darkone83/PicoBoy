@@ -72,12 +72,13 @@ SD card root
 │   ├── gb/     <- Game Boy ROMs  (.gb)
 │   ├── nes/    <- NES ROMs       (.nes)
 │   ├── 2600/   <- Atari 2600     (.a26, .bin)
-│   └── fc/     <- Famicom        (.nes, not playable yet)
+│   └── fc/     <- Famicom        
 ├── save/       <- battery saves  (created automatically)
 │   ├── gb/
 │   └── nes/
 └── state/      <- save states    (created automatically)
-    └── gb/
+    ├── gb/
+    └── nes/
 ```
 
 You only ever need to touch `roms/gb`, `roms/nes`, and `roms/2600` — saves and states are
