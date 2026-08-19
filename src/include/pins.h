@@ -9,8 +9,6 @@
 // #define PICOBOY_BREADBOARD  // stock Pico header: SELECT=20, MENU=22, no VBAT
 
 // LCD SPI clock -- independent of the pin map.
-//   24 MHz   : breadboard / long jumpers (safe)
-//   62.5 MHz : final PCB / short traces (fast)
 // SPI clock for the panel. Breadboard: start ~48 MHz; if the display shows
 // corrupt pixels/tearing, drop toward 31 MHz; if it's clean, try 62 MHz.
 // (PCB traces handle 62.5 MHz cleanly.)
@@ -25,14 +23,14 @@
 #define LCD_RST_PIN   6
 #define LCD_BL_PIN    7
 
-// ---- microSD over SPI1 (defined for later; unused in bring-up FW) ----
+// ---- microSD over SPI1 ----
 #define SD_SPI        spi1
 #define SD_SCK_PIN    10
 #define SD_MOSI_PIN   11
 #define SD_MISO_PIN   12
 #define SD_CS_PIN     13
 
-// ---- I2S audio over PIO (defined for later; unused in bring-up FW) ----
+// ---- I2S audio over PIO ----
 #define I2S_BCLK_PIN  16
 #define I2S_LRCLK_PIN 17
 #define I2S_DOUT_PIN  18

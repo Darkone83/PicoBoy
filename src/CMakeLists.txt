@@ -63,9 +63,6 @@ add_executable(picoboy
     src/atari_tia.c
 )
 
-# NOTE: third_party/peanut-gb/peanut_gb.h is vendored but intentionally NOT
-# compiled or included yet — the emulator is present but not wired.
-
 # Compile the WS2812 PIO program into a generated header.
 pico_generate_pio_header(picoboy ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)
 

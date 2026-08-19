@@ -20,7 +20,7 @@
 #include "peanut_gb.h"   // single-header core; included in exactly this one TU
 #include "gbcolors.h"    // GBC-bootstrap preset palettes + per-game auto-assignment
 
-// Stage 2d: dual-core. core0 runs the emulator + input, core1 blits the frame to
+// Dual-core. core0 runs the emulator + input, core1 blits the frame to
 // the panel. Double-buffered ping-pong over the inter-core FIFO: core0 fills one
 // framebuffer while core1 pushes the other, so emulation overlaps the (SPI-bound)
 // blit instead of running after it.
@@ -232,6 +232,14 @@ static bool load_state(void) {
     return ok;
 }
 
+// True if a save-state file currently exists for this game (so the overlay can
+// grey out Load State until there is something to load).
+static bool gb_state_exists(void) {
+    if (!g_state_path[0]) return false;
+    FILINFO fi;
+    return f_stat(g_state_path, &fi) == FR_OK;
+}
+
 // In-game pause overlay. Runs on core0 while core1 is parked in its FIFO wait
 // (so core0 owns the SPI bus). Edits settings live; persists on exit if changed.
 // Returns 1 to quit to the menu, 0 to resume play.
@@ -244,17 +252,20 @@ static int gb_overlay(void) {
     int  sel    = 0;
     bool dirty  = false;
     bool redraw = true;
+    bool have_saved = gb_state_exists();   // greys Load State until a state is written
     int  ret    = 0;
     char val[16];
+    int  title_off = 0, title_hold = 20, title_tick = 0;
 
     while (true) {
         if (redraw) {
             st7789_fill(g_theme->bg);
-            ui_header("Paused");
+            ui_pause_header(ui_now_playing(), title_off);
             for (int i = 0; i < N; i++) {
                 int      y  = 40 + i * 20;
                 bool     on = (i == sel);
-                uint16_t fg = on ? g_theme->sel_fg : g_theme->item_fg;
+                bool     dimmed = (i == 6) && !have_saved;   // Load State with nothing to load
+                uint16_t fg = on ? g_theme->sel_fg : (dimmed ? g_theme->footer_fg : g_theme->item_fg);
                 uint16_t bg = on ? g_theme->sel_bg : g_theme->bg;
                 if (on) ui_fill_pill(8, y - 3, LCD_W - 16, 18, bg);
                 char lbl[24];
@@ -274,6 +285,14 @@ static int gb_overlay(void) {
             }
             ui_footer("D-pad move/adjust  A select  B resume");
             redraw = false;
+        }
+
+        // Keep long ROM names moving without forcing the rest of the overlay to redraw.
+        if (++title_tick >= 2) {
+            title_tick = 0;
+            if (title_hold > 0) title_hold--;
+            else                title_off++;
+            ui_pause_title(ui_now_playing(), title_off);
         }
 
         buttons_update();
@@ -324,12 +343,14 @@ static int gb_overlay(void) {
                     led_set_state(LED_SD_BUSY);
                     bool ok = save_state();
                     led_set_state(LED_IDLE);
+                    if (ok) have_saved = true;               // Load State is now available
                     st7789_fill_rect(20, 210, 290, 10, g_theme->bg);
                     st7789_draw_string(20, 210, ok ? "State saved" : "Save failed",
                                        ok ? g_theme->ok : g_theme->err, g_theme->bg, 1);
                     break;
                 }
                 case 6: {                                   // Load State -> resume into it
+                    if (!have_saved) break;                  // greyed: nothing to load
                     led_set_state(LED_SD_BUSY);
                     bool ok = load_state();
                     led_set_state(LED_IDLE);

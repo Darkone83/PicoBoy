@@ -29,8 +29,7 @@ atari_cart_type_t atari_cart_type(void);
 const char *atari_cart_type_name(void);
 bool atari_cart_supported(void);
 
-// Cartridge-bus access. M0 implements the conventional 2K/4K and Atari
-// F8/F6/F4 (+ Superchip) families. More unusual hotspots are detected now
-// and will be filled in as the core comes online.
+// Cartridge-bus access.
+// F8/F6/F4 (+ Superchip) families.
 uint8_t atari_cart_read(uint16_t address);
 void atari_cart_write(uint16_t address, uint8_t value);

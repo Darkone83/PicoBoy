@@ -3,9 +3,12 @@
 // as C++ because the core is C++. nes_run() is exposed to the C loader via
 // extern "C".
 //
-// M1 (this build): video + input + SD-load on THEIR core. Audio is silent
-// (GetSoundBufferSize() returns 0 so the APU emits nothing); per-line blocking
-// blit. M2 adds pAPU->I2S; M3 adds DMA scanline push; M4 activates FDS.
+// Shipping build: video + input + SD-load, full 6-wave APU mixed to the shared
+// I2S (audio is the master clock), and native full-res scanline streaming --
+// core0 emulates + packs each 256-wide line into a ring, core1 DMAs it straight
+// to the panel (interlaced) so core0 never blocks on SPI. In-game pause overlay
+// with brightness/volume/frame-skip and .srm battery saves + .dat save states.
+// The FDS core is present (infones_fds); its disk-swap UI is future work.
 
 #include "InfoNES.h"
 #include "InfoNES_System.h"
@@ -50,7 +53,7 @@ const WORD NesPalette[64] = {
     0x7FFF, 0x5F9F, 0x675F, 0x733F, 0x7B1F, 0x7F1D, 0x7F39, 0x7B55, 0x7373, 0x6BB3, 0x63B5, 0x5BB8, 0x5BBC, 0x5EF7, 0x0000, 0x0000,
 };
 
-// nes_settings.h global (FDS auto-insert/swap; harmless defaults for M1)
+// nes_settings.h global (FDS auto-insert/swap; harmless defaults until the FDS UI lands)
 NesSettings settings = { { true, true } };
 
 // ---------------------------------------------------------------------------
@@ -119,10 +122,10 @@ void Frens::getextensionfromfilename(const char *filename, char *ext, size_t ext
 #define NES_DST_X ((LCD_W - NES_DST_W) / 2)           // centered -> 32 at 256w
 #define NES_DST_Y ((240   - NES_DST_H) / 2)           // centered -> 0  at 240h
 
-// Full-res scanline streaming (experimental). 0 = proven downscale+core1 blit.
-// 1 = native 256x232: each rendered line is DMA'd straight to the panel, no
-// framebuffer, core1 freed. Trades the rock-solid decoupled pipeline for native
-// resolution + ~60K arena back. Flip + rebuild to A/B on hardware.
+// Full-res scanline streaming. 1 (shipping default) = native 256x232: each
+// rendered line is DMA'd straight to the panel, no framebuffer, core1 freed --
+// native resolution with ~60K arena back. 0 = the older downscale + core1 blit
+// path, kept for A/B bring-up. Flip + rebuild to compare on hardware.
 #define NES_STREAM_FULLRES 1
 #define NES_STREAM_FIRST 4                             // first visible NES scanline (HSync gate)
 #define NES_STREAM_W     NES_DISP_WIDTH                // 256
@@ -178,6 +181,15 @@ extern "C" void nes_set_save_path(const char *path) {
     if (path) { strncpy(g_nes_save_path, path, sizeof g_nes_save_path - 1);
                 g_nes_save_path[sizeof g_nes_save_path - 1] = '\0'; }
     else g_nes_save_path[0] = '\0';
+}
+
+// .dat save-state path (the overlay's Save/Load State). Set by the loader before
+// nes_run(); "" disables. See save_nes_state()/load_nes_state() below.
+static char g_nes_state_path[96];
+extern "C" void nes_set_state_path(const char *path) {
+    if (path) { strncpy(g_nes_state_path, path, sizeof g_nes_state_path - 1);
+                g_nes_state_path[sizeof g_nes_state_path - 1] = '\0'; }
+    else g_nes_state_path[0] = '\0';
 }
 
 static absolute_time_t s_next;
@@ -464,30 +476,193 @@ int InfoNES_LoadFrame(void)
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Save states (the overlay's Save/Load State)
+// ---------------------------------------------------------------------------
+// The state file streams the InfoNES machine directly to SD -- no snapshot RAM
+// buffer, exactly like the GB core -- so it costs no arena and fits the budget:
+//   header (CPU + PPU registers + current bank mapping)
+//   RAM (8K) SRAM (8K) PPURAM (16K) SPRRAM (256) ChrBuf (32K) PalTable APU_Reg
+// On load these RAMs are overwritten in place: the arena is a deterministic bump
+// allocator, so the same firmware + ROM re-Inits every buffer at the identical
+// address, which also lets us store bank pointers as {region,offset} and rebuild
+// them. This mirrors classic InfoNES's own .sts format.
+//
+// CAVEAT (documented, matches upstream): bank *pointers* capture the current
+// mapping for every mapper, but each mapper's internal sequencing state (MMC1
+// shift reg, MMC3 IRQ latch/counter, VRC IRQ) is static inside its .cpp and is
+// NOT captured. Banking is correct on load; scanline-IRQ titles (SMB3, Kirby,
+// Mega Man 3-6, ...) may show a sub-frame status-bar hitch immediately after
+// load that self-corrects the same frame, because those games reprogram the
+// mapper every frame. Simple mappers (NROM/UxROM/CNROM/AxROM/MMC1) restore
+// cleanly.
+
+// K6502 CPU registers -- plain file-scope globals in k6502.cpp (unmangled), only
+// PC/IRQ/NMI are declared in k6502.h. Redeclaring here is a benign extern.
+extern WORD PC;
+extern BYTE SP, F, A, X, Y;
+extern BYTE IRQ_State, IRQ_Wiring, NMI_State;
+
+#define NES_STATE_MAGIC   0x534E4250u   // 'PBNS'
+#define NES_STATE_VERSION 1u
+
+typedef struct { uint8_t region; uint8_t pad[3]; uint32_t off; } nes_bankref_t;
+
+// Encode a live bank pointer as (region, runtime-offset) so it survives a
+// quit+relaunch of the same firmware+ROM. region 0 = arena (CHR-RAM pattern
+// tables / work RAM), 1 = flash XIP (PRG-ROM / CHR-ROM). Offsets use the live
+// bases, so they're independent of link addresses.
+static nes_bankref_t nes_bank_encode(const void *p) {
+    nes_bankref_t b; b.region = 1; b.pad[0] = b.pad[1] = b.pad[2] = 0; b.off = 0;
+    const uint8_t *cp = (const uint8_t *)p;
+    const uint8_t *ab = arena_base();
+    if (cp >= ab && cp < ab + ARENA_BYTES) { b.region = 0; b.off = (uint32_t)(cp - ab); }
+    else                                   { b.region = 1; b.off = (uint32_t)(cp - (const uint8_t *)XIP_BASE); }
+    return b;
+}
+static uint8_t *nes_bank_decode(nes_bankref_t b) {
+    return b.region == 0 ? arena_base() + b.off
+                         : (uint8_t *)XIP_BASE + b.off;
+}
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t hdr_size;
+    uint8_t  mapper_no;
+    uint8_t  rom_mirroring;
+    uint16_t prg_16k_banks;        // NesHeader.byRomSize -- guards against a wrong ROM
+    // CPU
+    uint16_t pc;
+    uint8_t  a, x, y, sp, f;
+    uint8_t  irq_state, irq_wiring, nmi_state;
+    // PPU registers / scroll / latches
+    uint8_t  ppu_r0, ppu_r1, ppu_r2, ppu_r3, ppu_r7;
+    uint8_t  ppu_scr_h_byte, ppu_scr_h_bit, ppu_latch_flag, ppu_updown_clip, ppu_nametablebank;
+    uint16_t ppu_addr, ppu_temp, ppu_increment, ppu_scanline;
+    uint8_t  vram_write_enable, frame_irq_enable, chrbuf_update, pad0;
+    uint16_t frame_step, pad1;
+    // current bank mapping
+    nes_bankref_t rombank[4];
+    nes_bankref_t ppubank[16];
+} nes_state_hdr_t;
+
+static bool save_nes_state(void) {
+    if (!g_nes_state_path[0]) return false;
+    FIL f;
+    if (f_open(&f, g_nes_state_path, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) return false;
+
+    nes_state_hdr_t h;
+    memset(&h, 0, sizeof h);
+    h.magic = NES_STATE_MAGIC; h.version = NES_STATE_VERSION; h.hdr_size = (uint16_t)sizeof h;
+    h.mapper_no = MapperNo; h.rom_mirroring = ROM_Mirroring; h.prg_16k_banks = NesHeader.byRomSize;
+    h.pc = PC; h.a = A; h.x = X; h.y = Y; h.sp = SP; h.f = F;
+    h.irq_state = IRQ_State; h.irq_wiring = IRQ_Wiring; h.nmi_state = NMI_State;
+    h.ppu_r0 = PPU_R0; h.ppu_r1 = PPU_R1; h.ppu_r2 = PPU_R2; h.ppu_r3 = PPU_R3; h.ppu_r7 = PPU_R7;
+    h.ppu_scr_h_byte = PPU_Scr_H_Byte; h.ppu_scr_h_bit = PPU_Scr_H_Bit;
+    h.ppu_latch_flag = PPU_Latch_Flag; h.ppu_updown_clip = PPU_UpDown_Clip;
+    h.ppu_nametablebank = PPU_NameTableBank;
+    h.ppu_addr = PPU_Addr; h.ppu_temp = PPU_Temp; h.ppu_increment = PPU_Increment;
+    h.ppu_scanline = PPU_Scanline;
+    h.vram_write_enable = byVramWriteEnable; h.frame_irq_enable = FrameIRQ_Enable;
+    h.chrbuf_update = ChrBufUpdate; h.frame_step = FrameStep;
+    for (int i = 0; i < 4;  i++) h.rombank[i] = nes_bank_encode(ROMBANK[i]);
+    for (int i = 0; i < 16; i++) h.ppubank[i] = nes_bank_encode(PPUBANK[i]);
+
+    UINT bw = 0;
+    bool ok = (f_write(&f, &h, sizeof h, &bw) == FR_OK && bw == sizeof h);
+    if (ok) ok = (f_write(&f, RAM,     RAM_SIZE,     &bw) == FR_OK && bw == RAM_SIZE);
+    if (ok) ok = (f_write(&f, SRAM,    SRAM_SIZE,    &bw) == FR_OK && bw == SRAM_SIZE);
+    if (ok) ok = (f_write(&f, PPURAM,  PPURAM_SIZE,  &bw) == FR_OK && bw == PPURAM_SIZE);
+    if (ok) ok = (f_write(&f, SPRRAM,  SPRRAM_SIZE,  &bw) == FR_OK && bw == SPRRAM_SIZE);
+    if (ok && ChrBuf)
+            ok = (f_write(&f, ChrBuf,  CHRBUF_SIZE,  &bw) == FR_OK && bw == CHRBUF_SIZE);
+    if (ok) ok = (f_write(&f, PalTable, sizeof(WORD) * 32, &bw) == FR_OK);
+    if (ok) ok = (f_write(&f, APU_Reg,  0x18,             &bw) == FR_OK);
+    f_close(&f);
+    return ok;
+}
+
+static bool load_nes_state(void) {
+    if (!g_nes_state_path[0]) return false;
+    FIL f;
+    if (f_open(&f, g_nes_state_path, FA_READ) != FR_OK) return false;
+
+    nes_state_hdr_t h;
+    UINT br = 0;
+    bool ok = (f_read(&f, &h, sizeof h, &br) == FR_OK && br == sizeof h
+               && h.magic == NES_STATE_MAGIC && h.version == NES_STATE_VERSION
+               && h.hdr_size == (uint16_t)sizeof h
+               && h.mapper_no == MapperNo && h.prg_16k_banks == NesHeader.byRomSize);
+
+    if (ok) {
+        if (ok) ok = (f_read(&f, RAM,    RAM_SIZE,    &br) == FR_OK && br == RAM_SIZE);
+        if (ok) ok = (f_read(&f, SRAM,   SRAM_SIZE,   &br) == FR_OK && br == SRAM_SIZE);
+        if (ok) ok = (f_read(&f, PPURAM, PPURAM_SIZE, &br) == FR_OK && br == PPURAM_SIZE);
+        if (ok) ok = (f_read(&f, SPRRAM, SPRRAM_SIZE, &br) == FR_OK && br == SPRRAM_SIZE);
+        if (ok && ChrBuf)
+                ok = (f_read(&f, ChrBuf, CHRBUF_SIZE, &br) == FR_OK && br == CHRBUF_SIZE);
+        if (ok) ok = (f_read(&f, PalTable, sizeof(WORD) * 32, &br) == FR_OK);
+        if (ok) ok = (f_read(&f, APU_Reg,  0x18,             &br) == FR_OK);
+    }
+    f_close(&f);
+    if (!ok) return false;
+
+    // Registers + current bank mapping.
+    PC = h.pc; A = h.a; X = h.x; Y = h.y; SP = h.sp; F = h.f;
+    IRQ_State = h.irq_state; IRQ_Wiring = h.irq_wiring; NMI_State = h.nmi_state;
+    PPU_R0 = h.ppu_r0; PPU_R1 = h.ppu_r1; PPU_R2 = h.ppu_r2; PPU_R3 = h.ppu_r3; PPU_R7 = h.ppu_r7;
+    PPU_Scr_H_Byte = h.ppu_scr_h_byte; PPU_Scr_H_Bit = h.ppu_scr_h_bit;
+    PPU_Latch_Flag = h.ppu_latch_flag; PPU_UpDown_Clip = h.ppu_updown_clip;
+    PPU_NameTableBank = h.ppu_nametablebank;
+    PPU_Addr = h.ppu_addr; PPU_Temp = h.ppu_temp; PPU_Increment = h.ppu_increment;
+    PPU_Scanline = h.ppu_scanline;
+    byVramWriteEnable = h.vram_write_enable; FrameIRQ_Enable = h.frame_irq_enable;
+    ChrBufUpdate = h.chrbuf_update; FrameStep = h.frame_step;
+    for (int i = 0; i < 4;  i++) ROMBANK[i] = nes_bank_decode(h.rombank[i]);
+    for (int i = 0; i < 16; i++) PPUBANK[i] = nes_bank_decode(h.ppubank[i]);
+    ChrBufUpdate = 0xFF;   // force a CHR cache refresh from the restored banks
+    return true;
+}
+
+// True if a save-state file currently exists for this game (greys Load State
+// until there is something to load).
+static bool nes_state_exists(void) {
+    if (!g_nes_state_path[0]) return false;
+    FILINFO fi;
+    return f_stat(g_nes_state_path, &fi) == FR_OK;
+}
+
 // In-game pause overlay, mirroring the GB one. Runs on core0 while core1 is parked
 // in its FIFO wait, so core0 owns the SPI bus. Edits brightness/volume live (NES
 // audio reads g_settings.volume per frame; backlight is PWM), persists on exit if
 // changed. NES has a fixed hardware palette so there's no Palette item, but Frame
 // Skip is offered (-1=Auto, 0..5) to cut blit load on heavy titles. Save/Load State
-// were removed: NES state serialization didn't fit the RAM budget alongside the
-// framebuffer. Returns 1 = quit to menu, 0 = resume.
+// stream the machine to the .dat set by the loader (see save_nes_state above).
+// Returns 1 = quit to menu, 0 = resume.
 static int nes_overlay(void)
 {
-    static const char *const labels[] = { "Resume", "Brightness", "Volume", "Frame Skip", "Quit" };
-    const int N = 5;
+    static const char *const labels[] = {
+        "Resume", "Brightness", "Volume", "Frame Skip", "Save State", "Load State", "Quit"
+    };
+    const int N = 7;
+    const bool have_path = (g_nes_state_path[0] != '\0');   // Save State enabled
+    bool have_saved = nes_state_exists();                   // Load State enabled
     int  sel = 0;
     bool dirty = false, redraw = true;
     int  ret = 0;
     char val[16];
+    int  title_off = 0, title_hold = 20, title_tick = 0;
 
     while (true) {
         if (redraw) {
             st7789_fill(g_theme->bg);
-            ui_header("Paused");
+            ui_pause_header(ui_now_playing(), title_off);
             for (int i = 0; i < N; i++) {
                 int      y  = 40 + i * 20;
                 bool     on = (i == sel);
-                uint16_t fg = on ? g_theme->sel_fg : g_theme->item_fg;
+                bool     dimmed = (i == 4 && !have_path) || (i == 5 && !have_saved);   // greyed
+                uint16_t fg = on ? g_theme->sel_fg : (dimmed ? g_theme->footer_fg : g_theme->item_fg);
                 uint16_t bg = on ? g_theme->sel_bg : g_theme->bg;
                 if (on) ui_fill_pill(8, y - 3, LCD_W - 16, 18, bg);
                 char lbl[24];
@@ -502,6 +677,14 @@ static int nes_overlay(void)
             }
             ui_footer("D-pad move/adjust  A select  B resume");
             redraw = false;
+        }
+
+        // Keep long ROM names moving without forcing the rest of the overlay to redraw.
+        if (++title_tick >= 2) {
+            title_tick = 0;
+            if (title_hold > 0) title_hold--;
+            else                title_off++;
+            ui_pause_title(ui_now_playing(), title_off);
         }
 
         buttons_update();
@@ -535,7 +718,24 @@ static int nes_overlay(void)
 
         if (ev & (1u << BTN_A)) {
             if (sel == 0) { ret = 0; break; }               // Resume
-            if (sel == 4) { ret = 1; break; }               // Quit to menu
+            else if (sel == 4 && have_path) {               // Save State
+                led_set_state(LED_SD_BUSY);
+                bool sok = save_nes_state();
+                led_set_state(LED_RUNNING);
+                if (sok) have_saved = true;                 // Load State is now available
+                st7789_fill_rect(16, 188, LCD_W - 32, 10, g_theme->bg);
+                st7789_draw_string(16, 188, sok ? "State saved" : "Save failed",
+                                   sok ? g_theme->ok : g_theme->err, g_theme->bg, 1);
+            }
+            else if (sel == 5 && have_saved) {              // Load State -> resume into it
+                led_set_state(LED_SD_BUSY);
+                bool lok = load_nes_state();
+                led_set_state(LED_RUNNING);
+                if (lok) { ret = 0; break; }
+                st7789_fill_rect(16, 188, LCD_W - 32, 10, g_theme->bg);
+                st7789_draw_string(16, 188, "No state / load failed", g_theme->err, g_theme->bg, 1);
+            }
+            else if (sel == 6) { ret = 1; break; }          // Quit to menu
         }
         sleep_ms(15);
     }

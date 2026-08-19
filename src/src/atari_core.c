@@ -1,7 +1,7 @@
 /*
  * PicoBoy Atari 2600 wrapper / platform glue.
  *
- * M2: cycle-stepped 6507 + RIOT + TIA, common carts, controls, TIA audio,
+ * 6507 + RIOT + TIA, common carts, controls, TIA audio,
  * PicoBoy pause/config overlay, and the existing Core1 ST7789 display path.
  */
 #include "atari_core.h"
@@ -167,11 +167,12 @@ static int atari_overlay(void) {
     bool dirty = false;
     bool redraw = true;
     char val[16];
+    int  title_off = 0, title_hold = 20, title_tick = 0;
 
     while (true) {
         if (redraw) {
             st7789_fill(g_theme->bg);
-            ui_header("Paused");
+            ui_pause_header(ui_now_playing(), title_off);
 
             for (int i = 0; i < N; i++) {
                 int y = 40 + i * 20;
@@ -204,6 +205,14 @@ static int atari_overlay(void) {
 
             ui_footer("D-pad move/adjust  A select  B resume");
             redraw = false;
+        }
+
+        // Keep long ROM names moving without forcing the rest of the overlay to redraw.
+        if (++title_tick >= 2) {
+            title_tick = 0;
+            if (title_hold > 0) title_hold--;
+            else                title_off++;
+            ui_pause_title(ui_now_playing(), title_off);
         }
 
         buttons_update();

@@ -6,7 +6,6 @@
  * removed.  PicoBoy emits one 160-pixel palette-index scanline and lets
  * atari_core hand complete frames to the existing ST7789 display path.
  *
- * M1 target: NTSC, joystick + console switches, no audio synthesis yet.
  */
 #include "atari_tia.h"
 #include <string.h>

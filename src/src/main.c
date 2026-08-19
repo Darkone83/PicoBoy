@@ -20,19 +20,19 @@
 #include "version.h"
 
 // The one shared emulator RAM arena (see arena.h). Defined here so it needs no
-// new source file in the build; GB and NES both carve their big buffers from it.
+// new source file in the build; cores carve their big buffers from it.
 uint8_t g_emu_arena[ARENA_BYTES] __attribute__((aligned(4)));
 uint8_t *arena_base(void) { return g_emu_arena; }
 
 static const char *const main_items[] = { "Browse ROMs", "Load last game", "Settings", "About" };
 
-// Runs the ROM staged in the flash window (set by Browse ROMs). Self-validates:
-// gb_core shows an error if the window holds no/bad ROM.
+// Runs the ROM staged in the flash window (set by Browse ROMs). Sf-validates:
+// core shows an error if the window holds no/bad ROM.
 static void load_last_game(void) {
     loader_launch_last();   // resolves the .srm from /lastrom.txt when the card is present
 }
 
-// Overclock for full-speed emulation. clk_peri follows clk_sys (250 MHz) so the
+// Overclock for full-speed emulation. clk_peri follows clk_sys so the
 // LCD SPI can clock well above 24 MHz (the PL022 divides it down to LCD_SPI_HZ).
 // PIO (audio + LED) runs off clk_sys too; its dividers are set at init, after
 // this, so they stay correct. The PIO/SPI init below all runs after this.
@@ -45,7 +45,7 @@ static void overclock(void) {
                 CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
                 clock_get_hz(clk_sys), clock_get_hz(clk_sys));
 
-    // clk_peri keeps following clk_sys (250 MHz) so the LCD SPI isn't capped at
+    // clk_peri keeps following clk_sys so the LCD SPI isn't capped at
     // 24 MHz -- the PL022 divides clk_sys down to LCD_SPI_HZ (pins.h). This runs
     // the SPI peripheral above its nominal rating; if the panel shows corrupt
     // pixels, lower LCD_SPI_HZ.

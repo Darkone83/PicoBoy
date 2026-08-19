@@ -16,9 +16,10 @@
 // ONLY for the duration of each call, so loop over these for big regions and the
 // LED timer / USB get serviced between sectors. The flash routines run from RAM;
 // no handler may execute from XIP while a call is in flight, hence the IRQ mask.
-// NOTE: single-core only. When core1 is launched in phase 2, these must also lock
-// out core1 (it can't execute-from or read flash mid-erase) via flash_safe_execute
-// or a multicore lockout.
+// SINGLE-CORE ONLY: these do NOT lock out core1, which cannot execute-from or read
+// flash mid-erase. The invariant is upheld by only calling them from the menu, where
+// no core is launched (loader_browse / settings flash ops). If a future caller runs
+// these while core1 is live, add a multicore lockout (flash_safe_execute) first.
 void flash_erase_sector(uint32_t offset);              // offset must be 4 KB-aligned
 void flash_program_page(uint32_t offset, const uint8_t *page256);  // offset 256-aligned
 

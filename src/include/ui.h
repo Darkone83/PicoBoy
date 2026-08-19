@@ -21,7 +21,15 @@ typedef enum {
 // Common chrome.
 void ui_header(const char *title);
 void ui_header_right(const char *title, const char *right);  // title + right-aligned text
+void ui_pause_header(const char *name, int offset);          // Paused + ROM marquee
+void ui_pause_title(const char *name, int offset);           // update marquee strip only
 void ui_footer(const char *hint);
+
+// "Now playing" ROM name, set by the loader before a core launches and shown in
+// the in-game pause overlay header. Pass "" (or NULL) to clear. The stored copy
+// keeps the loader name; ui_now_playing() never returns NULL (empty string if unset).
+void        ui_set_now_playing(const char *name);
+const char *ui_now_playing(void);
 
 // Battery badge (icon + %) at the header top-right; drawn by the header fns so
 // it rides along on every screen. Returns the x of its left edge so a caller can

@@ -3,9 +3,7 @@
 #include <stdint.h>
 
 // PicoBoy SD bring-up.
-// Stage 1 (this file): raw SPI card init -- prove wiring + card responds, read
-// type/capacity. NO filesystem. Stage 2 will layer FatFs on top for mount +
-// directory + file read/write.
+// Raw SPI card init
 
 typedef enum { SD_NONE, SD_V1, SD_V2_SDSC, SD_V2_SDHC } sd_type_t;
 

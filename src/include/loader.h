@@ -1,6 +1,6 @@
 #pragma once
 
-// SD-card ROM loader / browser (phase 3a).
+// SD-card ROM loader / browser.
 // Mounts the FAT volume (creating the /roms /save /state tree on first use),
 // lets the user pick a system folder then a ROM, streams the ROM into the flash
 // window, and launches it. Returns to the caller (main menu) when the user backs

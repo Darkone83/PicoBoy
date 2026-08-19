@@ -1,10 +1,9 @@
 /*
  * PicoBoy cycle-stepped MOS 6507 core.
  *
- * Written for the PicoBoy Atari 2600 integration.  It intentionally works one
- * external bus cycle at a time so TIA writes, WSYNC and cartridge hotspots stay
- * at CPU-cycle granularity.  Legal NMOS 6502 opcodes are implemented, plus the
- * common unofficial NOP encodings.  Other illegal opcodes halt the M1 core and
+ * Written for the PicoBoy Atari 2600 integration.
+ * Legal NMOS 6502 opcodes are implemented, plus the
+ * common unofficial NOP encodings.  Other illegal opcodes halt the core and
  * are reported by atari_core so we can add them from real compatibility data.
  */
 #include "atari_cpu.h"

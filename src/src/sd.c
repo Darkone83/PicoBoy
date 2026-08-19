@@ -4,7 +4,7 @@
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 
-// Stage 1: raw SD-over-SPI card init. No FatFs. Proves SPI1 wiring, that a card
+// Raw SD-over-SPI card init. No FatFs. Proves SPI1 wiring, that a card
 // is present and negotiates, and reads its type + capacity from the CSD.
 // CS is driven manually (GPIO), the usual approach for SD in SPI mode.
 

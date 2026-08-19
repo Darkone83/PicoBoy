@@ -32,7 +32,7 @@ static const sys_t SYS[] = {
     { "Game Boy",     "gb",   ".gb",  NULL,   true  },
     { "NES",          "nes",  ".nes", NULL,   true  },
     { "Atari 2600",   "2600", ".a26", ".bin", true  },
-    { "Famicom",      "fc",   ".nes", NULL,   false },
+    { "Famicom",      "fc",   ".nes", NULL,   true  },   // Japanese carts, runs on the NES core
 };
 #define NSYS ((int)(sizeof(SYS) / sizeof(SYS[0])))
 
@@ -429,19 +429,20 @@ void loader_browse(void) {
 
         if (n <= 0) {
             char m[40];
-            snprintf(m, sizeof m, "No %s ROMs", SYS[s].ext);
+            snprintf(m, sizeof m, "Put %s files in /roms/%s", SYS[s].ext, SYS[s].dir);
             show_msg(SYS[s].name, m, COL_GRAY);
             ui_transition(UI_TRANSITION_BACK);
             continue;
         }
 
-        int f = pick_list(
-            SYS[s].name,
-            n,
-            SYS[s].runnable
-                ? "A load  L/R page  B back"
-                : "L/R page  B back"
-        );
+        // When a folder holds more ROMs than the list buffer, the picker shows the
+        // first MAX_ENTRIES (alphabetical); flag that so it isn't silently truncated.
+        const char *ftr;
+        if (!SYS[s].runnable)         ftr = "L/R page  B back";
+        else if (n == MAX_ENTRIES)    ftr = "A load  L/R page  B back (full)";
+        else                          ftr = "A load  L/R page  B back";
+
+        int f = pick_list(SYS[s].name, n, ftr);
 
         if (f < 0) {
             ui_transition(UI_TRANSITION_BACK);
@@ -449,7 +450,7 @@ void loader_browse(void) {
         }
 
         if (!SYS[s].runnable) {
-            show_msg(SYS[s].name, "Core coming in phase 4", COL_PURPLE);
+            show_msg(SYS[s].name, "Not yet supported", COL_PURPLE);
             ui_transition(UI_TRANSITION_BACK);
             continue;
         }
@@ -465,13 +466,18 @@ void loader_browse(void) {
             strip_ext(base, sizeof base, s_names[f]);
 
             persist_last(SYS[s].dir, base);
+            ui_set_now_playing(base);            // shown in the in-game pause overlay
             led_set_state(LED_RUNNING);
 
-            if (strcmp(SYS[s].dir, "nes") == 0) {
-                char srm[96];
+            if (strcmp(SYS[s].dir, "nes") == 0 || strcmp(SYS[s].dir, "fc") == 0) {
+                // Famicom shares the NES core; paths just live under its own folder.
+                char srm[96], dat[96];
                 snprintf(srm, sizeof srm,
                          "/save/%s/%s.srm", SYS[s].dir, base);
+                snprintf(dat, sizeof dat,
+                         "/state/%s/%s.dat", SYS[s].dir, base);
                 nes_set_save_path(srm);
+                nes_set_state_path(dat);
                 nes_run();
 
             } else if (strcmp(SYS[s].dir, "2600") == 0) {
@@ -512,10 +518,13 @@ void loader_launch_last(void) {
 
     int sys_kind = SYSK_GB;
     uint32_t staged_size = 0;
+    bool have_last = false;   // set once we resolve a valid <sys>/<base> from /lastrom.txt
 
     gb_set_save_path("");
     gb_set_state_path("");
     nes_set_save_path("");
+    nes_set_state_path("");
+    ui_set_now_playing("");
 
     if (f_mount(&s_fs, "", 1) == FR_OK) {
         FIL f;
@@ -562,13 +571,19 @@ void loader_launch_last(void) {
                 const char *sysdir = line;
                 const char *base = slash + 1;
 
-                if (strcmp(sysdir, "nes") == 0) {
+                ui_set_now_playing(base);
+                have_last = true;
+
+                if (strcmp(sysdir, "nes") == 0 || strcmp(sysdir, "fc") == 0) {
                     sys_kind = SYSK_NES;
 
-                    char srm[96];
+                    char srm[96], dat[96];
                     snprintf(srm, sizeof srm,
                              "/save/%s/%s.srm", sysdir, base);
+                    snprintf(dat, sizeof dat,
+                             "/state/%s/%s.dat", sysdir, base);
                     nes_set_save_path(srm);
+                    nes_set_state_path(dat);
 
                 } else if (strcmp(sysdir, "2600") == 0) {
                     sys_kind = SYSK_ATARI;
@@ -589,6 +604,13 @@ void loader_launch_last(void) {
         }
     }
 
+    if (!have_last) {
+        // No /lastrom.txt yet (fresh device or card absent): point the player at
+        // Browse ROMs instead of dropping into a core's "no ROM staged" error.
+        show_msg("Load last game", "No recent game - Browse ROMs", COL_GRAY);
+        return;
+    }
+
     led_set_state(LED_RUNNING);
 
     if (sys_kind == SYSK_NES) {
@@ -598,7 +620,7 @@ void loader_launch_last(void) {
         if (staged_size == 0) {
             // Old /lastrom.txt from before Atari size metadata is not safe to
             // guess: 2600 mapper selection depends heavily on image size.
-            show_msg("Atari 2600", "Missing ROM size metadata", COL_RED);
+            show_msg("Atari 2600", "Reopen from Browse ROMs", COL_RED);
             return;
         }
 

@@ -22,10 +22,16 @@ const char *const button_names[NUM_BUTTONS] = {
 // adding multi-frame latency to gameplay.
 #define BUTTON_EDGE_LOCKOUT_US 20000u
 
+// D-pad auto-repeat (menus/lists/sliders only -- see buttons_pressed()). A held
+// direction fires its first synthetic edge after DELAY, then every INTERVAL.
+#define BUTTON_REPEAT_DELAY_US    400000u
+#define BUTTON_REPEAT_INTERVAL_US  90000u
+
 static uint16_t state;
 static uint16_t raw_prev;
 static uint16_t edges;
 static uint32_t last_edge_us[NUM_BUTTONS];
+static uint32_t repeat_at_us[NUM_BUTTONS];   // next synth-edge time for held D-pad; 0 = disarmed
 
 static uint16_t read_raw_buttons(void) {
     uint16_t raw = 0;
@@ -52,8 +58,10 @@ void buttons_init(void) {
     edges = 0;
 
     uint32_t now = time_us_32();
-    for (int i = 0; i < NUM_BUTTONS; i++)
+    for (int i = 0; i < NUM_BUTTONS; i++) {
         last_edge_us[i] = now - BUTTON_EDGE_LOCKOUT_US;
+        repeat_at_us[i] = 0;
+    }
 }
 
 void buttons_update(void) {
@@ -71,6 +79,24 @@ void buttons_update(void) {
             (uint32_t)(now - last_edge_us[i]) >= BUTTON_EDGE_LOCKOUT_US) {
             edges |= bit;
             last_edge_us[i] = now;
+            repeat_at_us[i] = now + BUTTON_REPEAT_DELAY_US;   // arm auto-repeat on this press
+        }
+    }
+
+    // Auto-repeat, D-pad only (indices BTN_UP..BTN_RIGHT). While a direction is
+    // held past the initial delay, inject a synthetic edge every interval so lists
+    // and value sliders advance on hold. Signed time compares tolerate the 32-bit
+    // microsecond wrap. Only the edge mask is touched; held state is untouched, so
+    // gameplay (which reads buttons_state()) is unaffected.
+    for (int i = BTN_UP; i <= BTN_RIGHT; i++) {
+        uint16_t bit = (uint16_t)(1u << i);
+        if (raw & bit) {
+            if (repeat_at_us[i] && (int32_t)(now - repeat_at_us[i]) >= 0) {
+                edges |= bit;
+                repeat_at_us[i] = now + BUTTON_REPEAT_INTERVAL_US;
+            }
+        } else {
+            repeat_at_us[i] = 0;                               // released: disarm
         }
     }
 

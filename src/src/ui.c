@@ -13,6 +13,18 @@
 #define LIST_Y (HDR_H + 10)
 #define GLYPH_W 8           // font8x8 advance is 8*scale px/char
 
+// "Now playing" name, shown in the in-game pause overlay header. Keep the full
+// loader name here; the pause header clips/marquees it to the available space.
+static char s_now_playing[80];
+
+void ui_set_now_playing(const char *name) {
+    if (name) { strncpy(s_now_playing, name, sizeof s_now_playing - 1);
+                s_now_playing[sizeof s_now_playing - 1] = '\0'; }
+    else s_now_playing[0] = '\0';
+}
+
+const char *ui_now_playing(void) { return s_now_playing; }
+
 // Blend two RGB565 colours: a + (b-a)*num/den.
 static uint16_t mix565(uint16_t a, uint16_t b, int num, int den) {
     int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
@@ -84,6 +96,44 @@ void ui_header_right(const char *title, const char *right) {
 
 void ui_header(const char *title) {
     ui_header_right(title, 0);
+}
+
+// Pause header keeps the ROM title comfortably separated from "Paused" and
+// gives it the remaining strip before the battery badge. Long names marquee.
+static int s_pause_title_x0 = 116;
+static int s_pause_title_x1 = 304;
+
+void ui_pause_title(const char *name, int offset) {
+    if (!name || !name[0]) return;
+
+    const int y = (HDR_H - 8) / 2;
+    int x0 = s_pause_title_x0;
+    int x1 = s_pause_title_x1;
+    if (x1 <= x0) return;
+
+    int text_w = (int)strlen(name) * GLYPH_W;
+    if (text_w <= x1 - x0) {
+        st7789_fill_rect(x0, y, x1 - x0, 8, g_theme->header_bg);
+        st7789_draw_string(x0, y, name, g_theme->header_fg, g_theme->header_bg, 1);
+    } else {
+        st7789_marquee(x0, x1, y, name, offset,
+                       g_theme->header_fg, g_theme->header_bg, 48);
+    }
+}
+
+void ui_pause_header(const char *name, int offset) {
+    st7789_fill_rect(0, 0, LCD_W, HDR_H, g_theme->header_bg);
+    st7789_draw_string(8, (HDR_H - 16) / 2, "Paused",
+                       g_theme->header_fg, g_theme->header_bg, 2);
+
+    int right_x = ui_battery_badge();
+    s_pause_title_x0 = 116;                    // 12 px breathing room after "Paused"
+    s_pause_title_x1 = right_x - 8;            // keep clear of battery/% readout
+    if (s_pause_title_x1 < s_pause_title_x0)
+        s_pause_title_x1 = s_pause_title_x0;
+
+    ui_pause_title(name, offset);
+    st7789_fill_rect(0, HDR_H - 2, LCD_W, 2, g_theme->accent);
 }
 
 // Small brand mark: accent rounded square with a knocked-out "play" triangle.
