@@ -52,8 +52,6 @@ add_executable(picoboy
     src/infones_papu.cpp
     src/k6502.cpp
     src/infones.cpp
-    src/infones_nsf.cpp
-    src/infones_fds.cpp
     src/theme.c
     src/battery.c
     src/atari_core.c
@@ -61,6 +59,13 @@ add_executable(picoboy
     src/atari_cpu.c
     src/atari_riot.c
     src/atari_tia.c
+    src/sms_core.c
+    src/render.c
+    src/sms.c
+    src/sn76496.c
+    src/system.c
+    src/vdp.c
+    src/z80.c
 )
 
 # Compile the WS2812 PIO program into a generated header.
