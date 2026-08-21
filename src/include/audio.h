@@ -44,3 +44,10 @@ void snd_atari_open(void);
 void snd_atari_sample(uint16_t level);  // nonlinear TIA mix, 0..32767
 bool snd_atari_flush(void);             // drain a partial block at pause/exit
 void snd_atari_close(void);
+// --- Sega Master System / Game Gear (SMSPlus) audio -----------------------
+// The core renders one 60 Hz frame into separate signed 16-bit L/R buffers.
+// PicoBoy folds them to mono for the MAX98357, applies the shared Volume setting,
+// and submits exactly n frames to I2S so audio remains the emulation clock.
+void snd_sms_open(void);
+bool snd_sms_frame(const int16_t *left, const int16_t *right, int n);
+void snd_sms_close(void);

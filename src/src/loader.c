@@ -10,6 +10,7 @@
 #include "gb_core.h"
 #include "nes_core.h"
 #include "atari_core.h"
+#include "sms_core.h"
 #include "arena.h"
 #include "pico/stdlib.h"
 #include "ff.h"
@@ -29,17 +30,30 @@ typedef struct {
 } sys_t;
 
 static const sys_t SYS[] = {
-    { "Game Boy",     "gb",   ".gb",  NULL,   true  },
-    { "NES",          "nes",  ".nes", NULL,   true  },
-    { "Atari 2600",   "2600", ".a26", ".bin", true  },
-    { "Famicom",      "fc",   ".nes", NULL,   true  },   // Japanese carts, runs on the NES core
+    { "Game Boy",      "gb",   ".gb",  NULL,   true  },
+    { "NES",           "nes",  ".nes", NULL,   true  },
+    { "Master System", "sms",  ".sms", NULL,   true  },
+    { "Game Gear",     "gg",   ".gg",  NULL,   true  },
+    { "Atari 2600",    "2600", ".a26", ".bin", true  },
+    { "Famicom",       "fc",   ".nes", NULL,   true  },   // Japanese carts, runs on the NES core
 };
 #define NSYS ((int)(sizeof(SYS) / sizeof(SYS[0])))
 
 // ---- list buffer ---------------------------------------------------------
 #define MAX_ENTRIES 128
 #define MAX_NAME    80       // ROM filename (LFN); longer names are truncated
-static char s_names[MAX_ENTRIES][MAX_NAME];
+
+/*
+ * 128 x 80 = 10,240 bytes. The browser only exists while no emulator is hot,
+ * so borrow the bottom of the shared arena instead of reserving this forever.
+ * A selected filename is copied to the stack before flash_from_sd() reuses the
+ * same arena for its 4 KiB sector staging buffer.
+ */
+static char (*s_names)[MAX_NAME] = NULL;
+
+static inline void names_bind_arena(void) {
+    s_names = (char (*)[MAX_NAME])arena_base();
+}
 
 static FATFS s_fs;
 
@@ -244,10 +258,14 @@ static void strip_ext(char *out, size_t n, const char *romfile) {
 static void persist_last(const char *sysdir, const char *base) {
     FIL f;
     if (f_open(&f, "/lastrom.txt", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
-        // "<sys>/<base>\n<flash size>"
-        char line[MAX_NAME + 24];
-        int len = snprintf(line, sizeof line, "%s/%s\n%lu",
-                           sysdir, base, (unsigned long)s_last_flash_size);
+        // "<sys>/<base>\n<flash size>\n<ROM flash offset>"
+        // Recording the dynamic base invalidates stale staged images after a
+        // firmware update changes __flash_binary_end.
+        char line[MAX_NAME + 40];
+        int len = snprintf(line, sizeof line, "%s/%s\n%lu\n%lu",
+                           sysdir, base,
+                           (unsigned long)s_last_flash_size,
+                           (unsigned long)rom_flash_offset());
         UINT bw = 0;
         f_write(&f, line, (UINT)len, &bw);
         f_close(&f);
@@ -337,17 +355,44 @@ static bool flash_from_sd(const char *path) {
     }
 
     uint32_t size = (uint32_t)f_size(&fil);
-    uint32_t window = NVS_FLASH_OFFSET - ROM_FLASH_OFFSET;
+    const uint32_t fw_end   = flash_firmware_end_offset();
+    const uint32_t rom_base = rom_flash_offset();
+    const uint32_t window   = rom_flash_capacity();
 
-    if (size == 0 || size > window) {
+    // Flash is erased in complete 4 KiB sectors, so validate the rounded write,
+    // not just the raw file length.
+    uint32_t staged_bytes = 0;
+    if (size != 0 && size <= UINT32_MAX - (FLASH_SECTOR_SIZE - 1u))
+        staged_bytes = (size + FLASH_SECTOR_SIZE - 1u) &
+                       ~(uint32_t)(FLASH_SECTOR_SIZE - 1u);
+
+    printf("[FLASH] total=%lu fw_end=0x%06lx rom_base=0x%06lx "
+           "nvs=0x%06lx capacity=%lu rom=%lu staged=%lu\n",
+           (unsigned long)PICO_FLASH_SIZE_BYTES,
+           (unsigned long)fw_end,
+           (unsigned long)rom_base,
+           (unsigned long)NVS_FLASH_OFFSET,
+           (unsigned long)window,
+           (unsigned long)size,
+           (unsigned long)staged_bytes);
+
+    if (size == 0 || staged_bytes == 0 ||
+        rom_base >= NVS_FLASH_OFFSET ||
+        staged_bytes > window) {
         f_close(&fil);
-        show_msg("ROM Loader",
-                 size == 0 ? "Empty file" : "ROM too big for flash",
-                 COL_RED);
+
+        if (size == 0) {
+            show_msg("ROM Loader", "Empty file", COL_RED);
+        } else if (rom_base >= NVS_FLASH_OFFSET) {
+            show_msg("ROM Loader", "No safe ROM flash window", COL_RED);
+        } else {
+            char msg[48];
+            snprintf(msg, sizeof msg, "ROM too big (%luK free)",
+                     (unsigned long)(window / 1024u));
+            show_msg("ROM Loader", msg, COL_RED);
+        }
         return false;
     }
-
-    s_last_flash_size = size;
 
     led_set_state(LED_FLASH_BUSY);
 
@@ -364,24 +409,49 @@ static bool flash_from_sd(const char *path) {
     ui_progress_pacman(0, (int)total);
 
     bool ok = true;
+    bool verify_failed = false;
 
     for (uint32_t off = 0; off < size; off += FLASH_SECTOR_SIZE) {
         UINT br = 0;
+        uint32_t remain = size - off;
+        UINT want = (UINT)(remain < FLASH_SECTOR_SIZE ? remain : FLASH_SECTOR_SIZE);
 
-        if (f_read(&fil, s_secbuf, FLASH_SECTOR_SIZE, &br) != FR_OK) {
+        if (f_read(&fil, s_secbuf, want, &br) != FR_OK || br != want) {
             ok = false;
             break;
         }
 
-        if (br < FLASH_SECTOR_SIZE)
-            memset(s_secbuf + br, 0xFF, FLASH_SECTOR_SIZE - br);
+        if (want < FLASH_SECTOR_SIZE)
+            memset(s_secbuf + want, 0xFF, FLASH_SECTOR_SIZE - want);
 
-        flash_erase_sector(ROM_FLASH_OFFSET + off);
+        uint32_t dst = rom_base + off;
 
-        for (uint32_t p = 0;
-             p < FLASH_SECTOR_SIZE;
-             p += FLASH_PAGE_SIZE) {
-            flash_program_page(ROM_FLASH_OFFSET + off + p, s_secbuf + p);
+        // Fail closed before *every* erase/program operation. This protects both
+        // the linked firmware below rom_base and the NVS sector above the window.
+        if (!rom_flash_range_valid(dst, FLASH_SECTOR_SIZE)) {
+            printf("[FLASH] REFUSED sector dst=0x%06lx len=%u\n",
+                   (unsigned long)dst, (unsigned)FLASH_SECTOR_SIZE);
+            verify_failed = true;
+            break;
+        }
+
+        bool verified = false;
+
+        // Program one complete sector, verify the XIP view, and retry once
+        // before reporting a flash failure.
+        for (int attempt = 0; attempt < 2; attempt++) {
+            flash_erase_sector(dst);
+            flash_program_sector(dst, s_secbuf);
+
+            if (memcmp(flash_ptr(dst), s_secbuf, FLASH_SECTOR_SIZE) == 0) {
+                verified = true;
+                break;
+            }
+        }
+
+        if (!verified) {
+            verify_failed = true;
+            break;
         }
 
         ui_progress_pacman((int)(++done), (int)total);
@@ -394,11 +464,19 @@ static bool flash_from_sd(const char *path) {
         return false;
     }
 
+    if (verify_failed) {
+        show_msg("ROM Loader", "Flash bounds/verify failed", COL_RED);
+        return false;
+    }
+
+    // Only publish the staged size after every sector has verified.
+    s_last_flash_size = size;
     return true;
 }
 
 // ---- public flow ---------------------------------------------------------
 void loader_browse(void) {
+    names_bind_arena();
     status("Mounting SD...");
 
     if (f_mount(&s_fs, "", 1) != FR_OK) {
@@ -455,15 +533,21 @@ void loader_browse(void) {
             continue;
         }
 
+        // flash_from_sd() borrows arena_base() for sector staging, so preserve
+        // the selected name before that overwrites the arena-backed list.
+        char selected[MAX_NAME];
+        strncpy(selected, s_names[f], sizeof selected - 1);
+        selected[sizeof selected - 1] = '\0';
+
         char full[MAX_NAME + 48];
         snprintf(full, sizeof full, "/roms/%s/%s",
-                 SYS[s].dir, s_names[f]);
+                 SYS[s].dir, selected);
 
         ui_transition(UI_TRANSITION_FORWARD);
 
         if (flash_from_sd(full)) {
             char base[MAX_NAME];
-            strip_ext(base, sizeof base, s_names[f]);
+            strip_ext(base, sizeof base, selected);
 
             persist_last(SYS[s].dir, base);
             ui_set_now_playing(base);            // shown in the in-game pause overlay
@@ -479,6 +563,19 @@ void loader_browse(void) {
                 nes_set_save_path(srm);
                 nes_set_state_path(dat);
                 nes_run();
+
+            } else if (strcmp(SYS[s].dir, "sms") == 0 || strcmp(SYS[s].dir, "gg") == 0) {
+                // SMS and Game Gear share the SMSPlus core and the same staged
+                // XIP ROM window. Keep saves/states separated by system folder.
+                char srm[96], dat[96];
+                snprintf(srm, sizeof srm,
+                         "/save/%s/%s.srm", SYS[s].dir, base);
+                snprintf(dat, sizeof dat,
+                         "/state/%s/%s.dat", SYS[s].dir, base);
+                sms_core_set_rom(s_last_flash_size, strcmp(SYS[s].dir, "gg") == 0);
+                sms_core_set_save_path(srm);
+                sms_core_set_state_path(dat);
+                sms_core_run();
 
             } else if (strcmp(SYS[s].dir, "2600") == 0) {
                 // Atari runs directly from the same staged XIP ROM window.
@@ -513,24 +610,30 @@ void loader_launch_last(void) {
     enum {
         SYSK_GB = 0,
         SYSK_NES,
+        SYSK_SMS,
         SYSK_ATARI
     };
 
     int sys_kind = SYSK_GB;
+    bool last_is_gg = false;
     uint32_t staged_size = 0;
+    uint32_t staged_offset = 0;
     bool have_last = false;   // set once we resolve a valid <sys>/<base> from /lastrom.txt
 
     gb_set_save_path("");
     gb_set_state_path("");
     nes_set_save_path("");
     nes_set_state_path("");
+    sms_core_set_rom(0, false);
+    sms_core_set_save_path("");
+    sms_core_set_state_path("");
     ui_set_now_playing("");
 
     if (f_mount(&s_fs, "", 1) == FR_OK) {
         FIL f;
 
         if (f_open(&f, "/lastrom.txt", FA_READ) == FR_OK) {
-            char line[MAX_NAME + 24];
+            char line[MAX_NAME + 40];
             UINT br = 0;
 
             f_read(&f, line, sizeof line - 1, &br);
@@ -541,6 +644,7 @@ void loader_launch_last(void) {
             // File:
             //   <sys>/<base>
             //   <staged flash size>
+            //   <ROM flash offset used when staged>
             char *nl = strchr(line, '\n');
 
             if (nl) {
@@ -551,6 +655,14 @@ void loader_launch_last(void) {
                     nl++;
 
                 staged_size = (uint32_t)strtoul(nl, NULL, 10);
+
+                char *nl2 = strchr(nl, '\n');
+                if (nl2) {
+                    nl2++;
+                    while (*nl2 == '\r' || *nl2 == ' ' || *nl2 == '\t')
+                        nl2++;
+                    staged_offset = (uint32_t)strtoul(nl2, NULL, 10);
+                }
             }
 
             // Trim trailing CR/space from the name line.
@@ -572,7 +684,29 @@ void loader_launch_last(void) {
                 const char *base = slash + 1;
 
                 ui_set_now_playing(base);
-                have_last = true;
+
+                // A firmware update can move the dynamic ROM window. Never boot
+                // stale bytes from the old offset; require the metadata written
+                // by the current staging scheme and verify its range.
+                uint32_t rounded = 0;
+                if (staged_size != 0 &&
+                    staged_size <= UINT32_MAX - (FLASH_SECTOR_SIZE - 1u)) {
+                    rounded = (staged_size + FLASH_SECTOR_SIZE - 1u) &
+                              ~(uint32_t)(FLASH_SECTOR_SIZE - 1u);
+                }
+
+                have_last =
+                    (staged_offset == rom_flash_offset()) &&
+                    (rounded != 0) &&
+                    (rounded <= rom_flash_capacity());
+
+                if (!have_last) {
+                    printf("[FLASH] last ROM stale/unsafe: saved_base=0x%06lx "
+                           "current_base=0x%06lx size=%lu\n",
+                           (unsigned long)staged_offset,
+                           (unsigned long)rom_flash_offset(),
+                           (unsigned long)staged_size);
+                }
 
                 if (strcmp(sysdir, "nes") == 0 || strcmp(sysdir, "fc") == 0) {
                     sys_kind = SYSK_NES;
@@ -584,6 +718,18 @@ void loader_launch_last(void) {
                              "/state/%s/%s.dat", sysdir, base);
                     nes_set_save_path(srm);
                     nes_set_state_path(dat);
+
+                } else if (strcmp(sysdir, "sms") == 0 || strcmp(sysdir, "gg") == 0) {
+                    sys_kind = SYSK_SMS;
+                    last_is_gg = (strcmp(sysdir, "gg") == 0);
+
+                    char srm[96], dat[96];
+                    snprintf(srm, sizeof srm,
+                             "/save/%s/%s.srm", sysdir, base);
+                    snprintf(dat, sizeof dat,
+                             "/state/%s/%s.dat", sysdir, base);
+                    sms_core_set_save_path(srm);
+                    sms_core_set_state_path(dat);
 
                 } else if (strcmp(sysdir, "2600") == 0) {
                     sys_kind = SYSK_ATARI;
@@ -615,6 +761,16 @@ void loader_launch_last(void) {
 
     if (sys_kind == SYSK_NES) {
         nes_run();
+
+    } else if (sys_kind == SYSK_SMS) {
+        if (staged_size == 0) {
+            show_msg(last_is_gg ? "Game Gear" : "Master System",
+                     "Reopen from Browse ROMs", COL_RED);
+            return;
+        }
+
+        sms_core_set_rom(staged_size, last_is_gg);
+        sms_core_run();
 
     } else if (sys_kind == SYSK_ATARI) {
         if (staged_size == 0) {

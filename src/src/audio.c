@@ -3,6 +3,7 @@
 #include "settings.h"
 #include "i2s.h"
 #include "minigb_apu.h"
+#include "arena.h"
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include <string.h>
@@ -20,12 +21,13 @@ static bool s_inited = false;
 // Recompute the identical value (738) with integer math for the buffer dimension.
 #define SND_FRAMES   ((AUDIO_SAMPLE_RATE * 70224u) / 4194304u)   // == AUDIO_SAMPLES
 
-// Only one emulator runs at a time. GB, NES and Atari therefore share one
-// stereo PCM staging buffer instead of each reserving ~3 KB of BSS.
-static int16_t s_pcmbuf[SND_FRAMES * 2];
+// One emulator runs at a time. Put the common stereo PCM staging buffer in
+// the 3 KiB tail reserved by arena.h instead of permanently charging .bss.
+static int16_t *s_pcmbuf = NULL;
 
 void snd_init(void) {
     if (s_inited) return;
+    s_pcmbuf = (int16_t *)arena_audio_base();
     s_cfg = i2s_get_default_config();
     s_cfg.sample_freq     = AUDIO_SAMPLE_RATE;   // 44100
     s_cfg.channel_count   = 2;
@@ -54,7 +56,7 @@ bool snd_play_frame(void) {
 
     uint8_t vol = g_settings.volume;              // 0..100 (%)
     if (vol == 0) {
-        memset(s_pcmbuf, 0, sizeof s_pcmbuf);               // mute -- DMA still runs to keep I2S clocked
+        memset(s_pcmbuf, 0, SND_FRAMES * 2u * sizeof(*s_pcmbuf));               // mute -- DMA still runs to keep I2S clocked
     } else {
         // minigb_apu output is hot. GB_AUDIO_HEADROOM is the attenuation shift that
         // rides under the 0-100% Volume setting: 2 = Pico-GB quiet default (-12 dB),
@@ -293,4 +295,66 @@ void snd_atari_close(void) {
     s_atari_filter_seeded = false;
     s_atari_px = 0;
     s_atari_hp = 0;
+}
+// ---------------------------------------------------------------------------
+// Sega Master System / Game Gear (SMSPlus) audio.
+// SMSPlus produces signed stereo PSG samples at 44.1 kHz. PicoBoy has a mono
+// speaker path, so average L/R, AC-couple the result, apply the common Volume
+// control and mirror it to both I2S channels. A full SMS frame is 735 samples,
+// which fits in the shared 738-frame staging buffer used by GB/NES/Atari.
+
+static bool s_sms_filter_seeded = false;
+static int  s_sms_px = 0;
+static int  s_sms_hp = 0;
+
+void snd_sms_open(void) {
+    snd_init();
+    s_sms_filter_seeded = false;
+    s_sms_px = 0;
+    s_sms_hp = 0;
+}
+
+bool snd_sms_frame(const int16_t *left, const int16_t *right, int n) {
+    if (!s_inited || !left || !right || n <= 0)
+        return false;
+
+    if (n > (int)SND_FRAMES)
+        n = (int)SND_FRAMES;
+
+    const uint8_t vol = g_settings.volume;
+
+    for (int i = 0; i < n; i++) {
+        int raw = ((int)left[i] + (int)right[i]) / 2;
+        int hp;
+
+        // Keep the same low-cost DC blocker used by the other PicoBoy cores.
+        // Seed it at the first sample so entering a game cannot create a pop.
+        if (!s_sms_filter_seeded) {
+            s_sms_px = raw;
+            s_sms_hp = 0;
+            s_sms_filter_seeded = true;
+            hp = 0;
+        } else {
+            hp = raw - s_sms_px + (s_sms_hp - (s_sms_hp >> 8));
+            s_sms_px = raw;
+            s_sms_hp = hp;
+        }
+
+        int v = vol ? (hp * (int)vol) / 100 : 0;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+
+        s_pcmbuf[i * 2]     = (int16_t)v;
+        s_pcmbuf[i * 2 + 1] = (int16_t)v;
+    }
+
+    s_cfg.dma_trans_count = (uint32_t)n;
+    i2s_dma_write(&s_cfg, s_pcmbuf);  // waits for previous DMA: audio is master clock
+    return true;
+}
+
+void snd_sms_close(void) {
+    s_sms_filter_seeded = false;
+    s_sms_px = 0;
+    s_sms_hp = 0;
 }

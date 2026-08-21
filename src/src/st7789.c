@@ -8,6 +8,25 @@
 #include "hardware/pwm.h"
 #include <string.h>
 
+/*
+ * Shared LCD scratch.
+ *
+ * These buffers used to be separate function-local statics:
+ *   fill row, glyph row/block, marquee row, blit row,
+ *   three independent x-maps, and DMA ping-pong rows.
+ * They are never needed by two of those helpers at once. The largest live set
+ * is xmap[320] (640 B) + two 640-byte DMA rows = 1,920 bytes.
+ *
+ * Per-scanline emulator streaming uses caller-owned row buffers and does not
+ * consume this scratch object.
+ */
+typedef struct {
+    uint16_t xmap[LCD_W];
+    uint8_t  lines[2][LCD_W * 2];
+} st7789_scratch_t;
+
+static st7789_scratch_t s_scratch;
+
 static inline void cs(bool lo)  { gpio_put(LCD_CS_PIN, !lo); }
 static inline void dc(bool data){ gpio_put(LCD_DC_PIN, data); }
 
@@ -93,7 +112,7 @@ void st7789_fill_rect(int x, int y, int w, int h, uint16_t color) {
     set_window(x, y, x + w - 1, y + h - 1);
 
     // Stream the fill one row at a time from a reusable line buffer.
-    static uint8_t line[LCD_W * 2];
+    uint8_t *line = s_scratch.lines[0];
     uint8_t hi = color >> 8, lo = color & 0xFF;
     for (int i = 0; i < w; i++) { line[i * 2] = hi; line[i * 2 + 1] = lo; }
 
@@ -132,7 +151,7 @@ static void st7789_draw_char_aa16(int x, int y, char c, uint16_t fg, uint16_t bg
         return;
     }
     set_window(x, y, x + 15, y + 15);
-    static uint8_t buf[16 * 2];
+    uint8_t *buf = s_scratch.lines[0];
     dc(true); cs(true);
     for (int row = 0; row < 16; row++) {
         int idx = 0;
@@ -164,7 +183,7 @@ void st7789_draw_char(int x, int y, char c, uint16_t fg, uint16_t bg, int scale)
     }
 
     set_window(x, y, x + cw - 1, y + ch - 1);
-    static uint8_t buf[8 * 8 * 4 * 2]; // up to scale 4 worth of one glyph row block
+    uint8_t *buf = &s_scratch.lines[0][0]; // 1280 contiguous bytes across both rows
     // Build and push row-block by row-block to keep the buffer bounded.
     dc(true); cs(true);
     for (int row = 0; row < 8; row++) {
@@ -201,7 +220,7 @@ void st7789_marquee(int x0, int x1, int y, const char *s, int off,
     if (period < 8) period = 8;
     int start = off % period; if (start < 0) start += period;
 
-    static uint8_t line[LCD_W * 2];
+    uint8_t *line = s_scratch.lines[0];
     set_window(x0, y, x0 + ww - 1, y + 7);
     dc(true); cs(true);
     for (int row = 0; row < 8; row++) {
@@ -226,7 +245,7 @@ void st7789_marquee(int x0, int x1, int y, const char *s, int off,
 void st7789_blit(int x, int y, int w, int h, const uint16_t *buf) {
     if (w <= 0 || h <= 0) return;
     set_window(x, y, x + w - 1, y + h - 1);
-    static uint8_t line[LCD_W * 2];
+    uint8_t *line = s_scratch.lines[0];
     dc(true); cs(true);
     for (int row = 0; row < h; row++) {
         const uint16_t *src = &buf[row * w];
@@ -247,10 +266,10 @@ void st7789_blit_scaled(int dx, int dy, int dst_w, int dst_h,
     if (dst_w <= 0 || dst_h <= 0 || dst_w > LCD_W) return;
     set_window(dx, dy, dx + dst_w - 1, dy + dst_h - 1);
 
-    static uint16_t xmap[LCD_W];
+    uint16_t *xmap = s_scratch.xmap;
     for (int ox = 0; ox < dst_w; ox++) xmap[ox] = (uint16_t)((ox * src_w) / dst_w);
 
-    static uint8_t line[LCD_W * 2];
+    uint8_t *line = s_scratch.lines[0];
     dc(true); cs(true);
     for (int oy = 0; oy < dst_h; oy++) {
         const uint16_t *srow = &src[(size_t)((oy * src_h) / dst_h) * src_w];
@@ -288,10 +307,10 @@ void st7789_blit_scaled_dma(int dx, int dy, int dst_w, int dst_h,
     blit_dma_init();
     set_window(dx, dy, dx + dst_w - 1, dy + dst_h - 1);
 
-    static uint16_t xmap[LCD_W];
+    uint16_t *xmap = s_scratch.xmap;
     for (int ox = 0; ox < dst_w; ox++) xmap[ox] = (uint16_t)((ox * src_w) / dst_w);
 
-    static uint8_t lines[2][LCD_W * 2];     // ping-pong row buffers
+    uint8_t (*lines)[LCD_W * 2] = s_scratch.lines; // shared ping-pong rows
     int cur = 0;
 
     // pack row 0
@@ -362,10 +381,10 @@ void st7789_blit_scaled_field(int dx, int dy, int dst_w, int dst_h,
                               const uint16_t *src, int src_w, int src_h, int field) {
     if (dst_w <= 0 || dst_h <= 0 || dst_w > LCD_W) return;
 
-    static uint16_t xmap[LCD_W];
+    uint16_t *xmap = s_scratch.xmap;
     for (int ox = 0; ox < dst_w; ox++) xmap[ox] = (uint16_t)((ox * src_w) / dst_w);
 
-    static uint8_t line[LCD_W * 2];
+    uint8_t *line = s_scratch.lines[0];
     for (int oy = (field & 1); oy < dst_h; oy += 2) {
         const uint16_t *srow = &src[(size_t)((oy * src_h) / dst_h) * src_w];
         for (int ox = 0; ox < dst_w; ox++) {

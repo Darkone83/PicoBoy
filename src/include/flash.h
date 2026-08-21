@@ -1,27 +1,50 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include "hardware/flash.h"   // FLASH_SECTOR_SIZE (4096), FLASH_PAGE_SIZE (256)
 #include "pico/stdlib.h"      // XIP_BASE, PICO_FLASH_SIZE_BYTES
 
-// Flash map (offsets from flash base; add XIP_BASE for a CPU-readable pointer):
-//   program   : base .. (grows up; ~200 KB today, lots of headroom under 0x80000)
-//   ROM window: 0x80000 .. NVS  (phase-2 staged GB ROM lives here)
-//   NVS       : top 4 KB sector (persistent settings)
-// Zones are fixed and non-overlapping, so each op erases only its own range.
-#define ROM_FLASH_OFFSET  0x80000u
-#define NVS_FLASH_OFFSET  ((uint32_t)(PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE))
+/*
+ * PicoBoy flash map
+ * -----------------
+ *
+ * Do NOT hard-code the ROM staging area at 0x80000.
+ *
+ * The firmware has grown as emulator cores were added, and a fixed 512 KiB
+ * boundary can eventually overlap the linked image. Erasing/programming a ROM
+ * into such an overlap destroys the currently running firmware.
+ *
+ * Instead:
+ *
+ *   firmware  : flash base .. __flash_binary_end
+ *   guard     : one complete 4 KiB sector
+ *   ROM       : sector-aligned dynamic base .. NVS
+ *   NVS       : final 4 KiB sector
+ *
+ * The linker-provided __flash_binary_end includes the actual flash-resident
+ * image, including load images for RAM sections. rom_flash_offset() rounds past
+ * it and leaves one extra sector untouched.
+ */
+#define NVS_FLASH_OFFSET ((uint32_t)(PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE))
 
-// IRQ-safe single-sector erase / single-page program. Interrupts are disabled
-// ONLY for the duration of each call, so loop over these for big regions and the
-// LED timer / USB get serviced between sectors. The flash routines run from RAM;
-// no handler may execute from XIP while a call is in flight, hence the IRQ mask.
-// SINGLE-CORE ONLY: these do NOT lock out core1, which cannot execute-from or read
-// flash mid-erase. The invariant is upheld by only calling them from the menu, where
-// no core is launched (loader_browse / settings flash ops). If a future caller runs
-// these while core1 is live, add a multicore lockout (flash_safe_execute) first.
-void flash_erase_sector(uint32_t offset);              // offset must be 4 KB-aligned
-void flash_program_page(uint32_t offset, const uint8_t *page256);  // offset 256-aligned
+uint32_t flash_firmware_end_offset(void);
+uint32_t rom_flash_offset(void);
+uint32_t rom_flash_capacity(void);
+bool     rom_flash_range_valid(uint32_t offset, size_t length);
+
+/*
+ * Backward-compatible name used throughout the emulator cores.
+ * This is intentionally a runtime expression now, not a fixed constant.
+ */
+#define ROM_FLASH_OFFSET (rom_flash_offset())
+
+// IRQ-safe erase/program helpers.
+// These are generic because settings_save() legitimately writes the NVS sector.
+// ROM callers must validate with rom_flash_range_valid() before modifying flash.
+void flash_erase_sector(uint32_t offset);                       // 4 KiB aligned
+void flash_program_page(uint32_t offset, const uint8_t *page256);   // 256 B aligned
+void flash_program_sector(uint32_t offset, const uint8_t *sector4096); // 4 KiB aligned
 
 static inline const uint8_t *flash_ptr(uint32_t offset) {
     return (const uint8_t *)(XIP_BASE + offset);

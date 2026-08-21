@@ -39,8 +39,6 @@
 #include "InfoNES_System.h"
 #include "InfoNES_Mapper.h"
 #include "InfoNES_pAPU.h"
-#include "InfoNES_NSF.h"
-#include "InfoNES_FDS.h"
 #include "K6502.h"
 #include <assert.h>
 #include <pico.h>
@@ -109,10 +107,8 @@ BYTE *SPRRAM;
 //   *size = SPRRAM_SIZE;
 //   return SPRRAM;
 // }
-/* Scanline Table */
-/* Sized for the largest region (PAL/Dendy: 312 scanlines). NTSC uses indices
- * 0..261; PAL/Dendy use 0..311. The init loop fills the full range. */
-BYTE PPU_ScanTable[312];
+/* Scanline Table: fixed NTSC timing uses scanlines 0..261. */
+BYTE PPU_ScanTable[262];
 #pragma endregion
 
 bool SRAMwritten = false;
@@ -230,12 +226,6 @@ BYTE ChrBufUpdate;
 /* Palette Table */
 WORD PalTable[32];
 
-/* Region-dependent timing. Defaults to NTSC; InfoNES_SetRegion() overrides. */
-WORD STEP_PER_SCANLINE = 114;
-WORD STEP_PER_FRAME    = 29780;
-WORD SCAN_VBLANK_START = 241;
-WORD SCAN_VBLANK_END   = 261;
-
 /* Table for Mirroring */
 BYTE PPU_MirrorTable[][4] =
     {
@@ -310,9 +300,6 @@ BYTE ROM_Trainer;
 /* Four screen VRAM  */
 BYTE ROM_FourScr;
 
-/* True when the loaded image is a Famicom Disk System disk (no iNES header). */
-bool IsFDS = false;
-
 /*===================================================================*/
 /*                                                                   */
 /*                InfoNES_Init() : Initialize InfoNES                */
@@ -338,9 +325,8 @@ void InfoNES_Init()
   // Initialize 6502
   K6502_Init();
 
-  // Initialize Scanline Table over the full PAL/Dendy range. SCAN_VBLANK_START
-  // is region-dependent (241 for NTSC/PAL, 291 for Dendy) so post-render and
-  // vblank boundaries land in the right place per region.
+  // Initialize the fixed NTSC scanline table (262 lines). PicoBoy only stages
+  // iNES cartridges and always runs the NES core with NTSC timing.
   for (nIdx = 0; nIdx < (int)(sizeof PPU_ScanTable); ++nIdx)
   {
     if (nIdx < SCAN_UNKNOWN_START)
@@ -463,35 +449,15 @@ int InfoNES_Reset()
   //   MapperNo |= (NesHeader.byInfo2 & 0xf0);
   // }
 
-  if (IsFDS)
-  {
-    // Famicom Disk System: no iNES header, dispatch through synthetic mapper 20.
-    MapperNo = 20;
-    ROM_Mirroring = 0;
-    ROM_SRAM = 0;
-    ROM_Trainer = 0;
-    ROM_FourScr = 0;
-  }
-  else if (IsNSF)
-  {
-    // Nintendo Sound Format: dispatch through synthetic mapper 31.
-    MapperNo = 31;
-    ROM_Mirroring = 0;
-    ROM_SRAM = 0;
-    ROM_Trainer = 0;
-    ROM_FourScr = 0;
-  }
-  else
-  {
-    // Mapper Number is 8bits. Always use lower 4bits of byInfo2 for compatibility with old ROMs.
-    MapperNo = (NesHeader.byInfo1 >> 4) | (NesHeader.byInfo2 & 0xf0);
+  // Mapper Number is 8bits. Always use the upper nibble of byInfo2 for
+  // compatibility with ordinary iNES cartridge images.
+  MapperNo = (NesHeader.byInfo1 >> 4) | (NesHeader.byInfo2 & 0xf0);
 
-    // Get information on the ROM
-    ROM_Mirroring = NesHeader.byInfo1 & 1;
-    ROM_SRAM = NesHeader.byInfo1 & 2;
-    ROM_Trainer = NesHeader.byInfo1 & 4;
-    ROM_FourScr = NesHeader.byInfo1 & 8;
-  }
+  // Get information on the cartridge.
+  ROM_Mirroring = NesHeader.byInfo1 & 1;
+  ROM_SRAM = NesHeader.byInfo1 & 2;
+  ROM_Trainer = NesHeader.byInfo1 & 4;
+  ROM_FourScr = NesHeader.byInfo1 & 8;
 
   /*-------------------------------------------------------------------*/
   /*  Initialize resources                                             */
@@ -566,12 +532,6 @@ int InfoNES_Reset()
   /*-------------------------------------------------------------------*/
 
   K6502_Reset();
-
-  // NSF: override CPU state after reset (A=track, X=region, SP=$FD, PC=$4100)
-  if (IsNSF)
-  {
-    nsfSetupCpuState();
-  }
 
   // Successful
   return 0;
@@ -669,95 +629,6 @@ void InfoNES_Mirroring(int nType)
 
 /*===================================================================*/
 /*                                                                   */
-/*              InfoNES_Main() : The main loop of InfoNES            */
-/*                                                                   */
-/*===================================================================*/
-namespace
-{
-  int s_region = INFONES_REGION_NTSC;
-}
-
-void InfoNES_SetRegion(int region)
-{
-  s_region = region;
-  switch (region)
-  {
-  case INFONES_REGION_PAL:
-    // PAL: 312 lines/frame at 50.007 Hz, CPU 1.662607 MHz.
-    STEP_PER_SCANLINE = 107;
-    STEP_PER_FRAME    = 33247;
-    SCAN_VBLANK_START = 241;
-    SCAN_VBLANK_END   = 311;
-    break;
-
-  case INFONES_REGION_DENDY:
-    // Dendy: PAL CPU clock + 312-line frame, but NTSC-style late vblank
-    // (vblank 291..311). Post-render extends from line 240 to 290.
-    STEP_PER_SCANLINE = 107;
-    STEP_PER_FRAME    = 33247;
-    SCAN_VBLANK_START = 291;
-    SCAN_VBLANK_END   = 311;
-    break;
-
-  case INFONES_REGION_NTSC:
-  default:
-    // NTSC: 262 lines/frame at 60.0988 Hz, CPU 1.789773 MHz.
-    s_region = INFONES_REGION_NTSC;
-    STEP_PER_SCANLINE = 114;
-    STEP_PER_FRAME    = 29780;
-    SCAN_VBLANK_START = 241;
-    SCAN_VBLANK_END   = 261;
-    break;
-  }
-}
-
-int InfoNES_GetRegion()
-{
-  return s_region;
-}
-
-bool InfoNES_IsPal()
-{
-  return s_region != INFONES_REGION_NTSC;
-}
-
-void InfoNES_Main(int region)
-{
-  /*
-   *  The main loop of InfoNES
-   *
-   */
-
-  // Region must be set before Init() so pAPU/PPU pick up region-dependent
-  // constants. Sets PPU timing now; APU rate tables and frame pacing are
-  // region-aware in later steps.
-  InfoNES_SetRegion(region);
-
-  // Initialize InfoNES
-  InfoNES_Init();
-
-  // Main loop
-  // while (1)
-  // {
-  /*-------------------------------------------------------------------*/
-  /*  To the menu screen                                               */
-  /*-------------------------------------------------------------------*/
-  if (InfoNES_Menu() == 0)
-  {
-    
-    /*-------------------------------------------------------------------*/
-    /*  Start a NES emulation                                            */
-    /*-------------------------------------------------------------------*/
-    InfoNES_Cycle();
-  }
-  //}
-
-  // Completion treatment
-  InfoNES_Fin();
-}
-
-/*===================================================================*/
-/*                                                                   */
 /*              InfoNES_Cycle() : The loop of emulation              */
 /*                                                                   */
 /*===================================================================*/
@@ -826,10 +697,6 @@ void __not_in_flash_func(InfoNES_Cycle)()
     // A mapper function in H-Sync
     MapperHSync();
 
-#if PICO_RP2350
-    fdsCheckPendingRebuild();
-#endif
-
     // A function in H-Sync
     if (InfoNES_HSync() == -1)
       return; // To the menu screen
@@ -873,12 +740,7 @@ int __not_in_flash_func(InfoNES_HSync)()
     if (PPU_Scanline >= 4 && PPU_Scanline < 240 - 4)
     {
       InfoNES_PreDrawLine(PPU_Scanline);
-      /* NSF mode has no PPU work — InfoNES_PostDrawLine paints the
-         NSF VU-meter overlay over the line buffer, so skipping the
-         PPU pixel pipeline buys back a large slice of CPU time
-         (Akumajou1.nsf and other heavy NSFs). */
-      if (!IsNSF)
-        InfoNES_DrawLine();
+      InfoNES_DrawLine();
       InfoNES_PostDrawLine(PPU_Scanline);
     }
     // todo: 描画しないラインにもスプライトオーバーレジスタとかは反映する必要がある
@@ -934,8 +796,7 @@ int __not_in_flash_func(InfoNES_HSync)()
   /*-------------------------------------------------------------------*/
   /*  Operation in the specific scanning line                          */
   /*-------------------------------------------------------------------*/
-  // Refactored from a switch into if/else because SCAN_VBLANK_START is now a
-  // runtime value (region-dependent: 241 for NTSC/PAL, 291 for Dendy).
+  // Fixed NTSC scanline timing.
   if (PPU_Scanline == SCAN_TOP_OFF_SCREEN)
   {
     // Reset a PPU status

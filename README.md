@@ -4,9 +4,10 @@
    <img src="https://github.com/Darkone83/PicoBoy/blob/main/images/Darkone83.png" width=400><img src="https://github.com/Darkone83/PicoBoy/blob/main/images/Picoboy.jpg" width=400>
 </div>
 
-A tiny handheld that plays **Game Boy**, **NES**, and **Atari 2600** games, built around a bare
-RP2040. Load ROMs from a microSD card, keep your saves, pick your palette, and
-carry it in a pocket.
+A tiny handheld multi-system emulator built around a bare RP2040. PicoBoy plays
+**Game Boy**, **NES / Famicom**, **Atari 2600**, **Sega Master System**, and
+**Game Gear** games from microSD, with a shared one-core-at-a-time architecture
+designed to make the most of the RP2040's limited RAM.
 
 **Questions, help, or just want to show off your build? <a href="https://discord.gg/k2BQhSJ"><img src="https://github.com/Darkone83/PicoBoy/blob/main/images/discord.svg"></a>.**
 
@@ -19,12 +20,18 @@ carry it in a pocket.
 
 ## Features
 
-- **Game Boy (DMG), NES, and Atari 2600** games, loaded from microSD
-- **Battery saves** and **save states** for supported Game Boy / NES titles
-- **In-game menu** — pause, brightness, volume, frame-skip, system-specific options, quit
-- **Atari 2600 NTSC emulation** — `.a26` / `.bin`, 2K, 4K, F8, F6, F4, and Superchip variants
+- **Five emulation families** — Game Boy, NES / Famicom, Atari 2600, Sega Master System, and Game Gear
+- **ROM loading from microSD** with per-system folders and *Load last game*
+- **Battery saves and save states** for supported Game Boy, NES / Famicom, Master System, and Game Gear titles
+- **In-game menu** — pause, brightness, volume, frame-skip, save-state and system-specific options
+- **Master System / Game Gear emulation** based on SMS Plus / pico-smsplus, adapted to PicoBoy's ST7789 and I²S paths
+- **Game Gear display modes** — native 160×144 pixel-perfect output or optional exact 2× cropped zoom
+- **Atari 2600 NTSC emulation** — `.a26` / `.bin`, 2K, 4K, F8, F6, F4, and common Superchip variants
+- **Atari phosphor persistence** to reduce intentional alternating-frame flicker used by some 2600 games
+- **Dynamic protected ROM staging** — the flash ROM window follows the linked firmware size instead of relying on a fixed address
+- **Shared 132 KiB emulator arena** with one active core at a time to keep permanent SRAM use low
 - **Selectable colour palettes** for Game Boy games
-- **On-screen battery meter** with charging, full, and low-battery states
+- **On-screen battery meter** with charging, full, low-battery, and critical-battery states
 - **Themeable UI**
 - **Built-in diagnostics** for the screen, buttons, LED, audio, and SD card
 
@@ -62,27 +69,33 @@ That's it. To update later, just repeat with a newer `picoboy.uf2`.
 ## SD card setup
 
 Format a microSD card as **FAT32**, then drop your ROMs into the matching folder.
-PicoBoy **creates all of these folders for you** on first boot with a card
-inserted, so you can also just boot once and then copy ROMs in. If you'd rather
-lay it out yourself first, here's the structure:
+PicoBoy creates its working folders automatically on first boot with a card
+inserted. If you want to lay the card out yourself first, the 1.0.4 structure is:
 
-```
+```text
 SD card root
 ├── roms/
-│   ├── gb/     <- Game Boy ROMs  (.gb)
-│   ├── nes/    <- NES ROMs       (.nes)
-│   ├── 2600/   <- Atari 2600     (.a26, .bin)
-│   └── fc/     <- Famicom        
-├── save/       <- battery saves  (created automatically)
+│   ├── gb/      <- Game Boy ROMs       (.gb)
+│   ├── nes/     <- NES ROMs            (.nes)
+│   ├── fc/      <- Famicom ROMs        (.nes)
+│   ├── sms/     <- Master System ROMs  (.sms)
+│   ├── gg/      <- Game Gear ROMs      (.gg)
+│   └── 2600/    <- Atari 2600 ROMs     (.a26, .bin)
+├── save/        <- battery saves (created automatically)
 │   ├── gb/
-│   └── nes/
-└── state/      <- save states    (created automatically)
+│   ├── nes/
+│   ├── sms/
+│   └── gg/
+└── state/       <- save states (created automatically)
     ├── gb/
-    └── nes/
+    ├── nes/
+    ├── sms/
+    └── gg/
 ```
 
-You only ever need to touch `roms/gb`, `roms/nes`, and `roms/2600` — saves and states are
-written for you where supported. (ROMs are not included; use games you legally own.)
+You normally only need to manage the folders under `roms/`; PicoBoy writes saves
+and states where supported. Atari 2600 save states are not currently implemented.
+ROMs are not included — use games you legally own.
 
 ---
 
@@ -117,10 +130,20 @@ written for you where supported. (ROMs are not included; use games you legally o
 
 ### In-game menu
 
-Press **MENU** while playing to pause and open the overlay: resume, brightness,
-volume, palette, frame-skip, save state, load state, and quit back to the menu.
+Press **MENU** while playing to pause and open the system overlay. Brightness,
+volume and frame-skip are shared controls; other entries depend on the active
+system.
 
----
+- **Game Boy** — adds palette selection plus save / load state where supported.
+- **NES / Famicom** — includes save / load state.
+- **Master System** — includes save / load state.
+- **Game Gear** — includes save / load state plus **GG Display**:
+  - **Native** — 160×144, centered, exact 1:1 pixels.
+  - **2x Zoom** — center-crops the source to 160×120 and expands it to 320×240
+    using exact 2×2 pixels. This fills the LCD without fractional scaling, but
+    crops 12 source lines from the top and bottom. (Lower performance)
+- **Atari 2600** — Resume, Brightness, Volume, Frame Skip, and Quit.
+
 
 ## LED status reference
 
@@ -141,45 +164,33 @@ PicoBoy has a single RGB status LED. The **colour** tells you the category, and
 | Orange | Solid | Charging |
 | Amber | Slow blink | Battery low |
 
-### Error codes (red blinking LED)
- 
-When something goes wrong the status LED blinks **red** in a repeating group —
-**count the blinks** to identify the problem — and the screen shows the same
-reason in words. Press **B** to back out.
- 
-| Blinks | On-screen message | What it means | What to do |
-|:------:|-------------------|---------------|------------|
-| **2** | `Flash a ROM .uf2 first` | *Load last game* was chosen but no Game Boy ROM is staged in flash | Use **Browse ROMs** from an SD card, or bake one in with `rom2uf2` (below) |
-| **3** | `ROM load failed` | A game couldn't be read or loaded from the SD card | Check it's a valid ROM in the right `roms/` folder, on a seated FAT32 card |
-| **4** | `Out of RAM (fb)` | Not enough memory to set up the frame buffers (rare) | Restart; report it if it keeps happening |
-
-### Error messages
+### Error reference
 
 When something goes wrong the status LED blinks **red** and the screen shows the
-reason. Press **B** to back out. The common ones:
+reason. Press **B** to back out.
 
-| On-screen message | What it means | What to do |
-|-------------------|---------------|------------|
-| `Flash a ROM .uf2 first` | *Load last game* was chosen but no Game Boy ROM is staged in flash | Use **Browse ROMs** from an SD card, or bake one in with `rom2uf2` (below) |
-| `ROM load failed` | A NES ROM couldn't be read from the SD card | Check it's a valid `.nes` in `roms/nes` and the card is seated and FAT32 |
-| `Out of RAM (fb)` | Not enough memory to set up the NES frame buffers (rare) | Restart; report it if it keeps happening |
+| Blinks | On-screen message | What it means | What to do |
+|:------:|-------------------|---------------|------------|
+| **2** | `Flash a ROM .uf2 first` | No valid ROM is currently staged for *Load last game* | Use **Browse ROMs** from the SD card to stage the game again. A firmware update can intentionally invalidate an older staged image if the safe ROM window moved. |
+| **3** | `ROM load failed` | A selected game could not be read or staged | Check the file extension, the matching `roms/` folder, and that the FAT32 card is seated correctly. |
+| **4** | `Out of RAM (fb)` | A core could not allocate its runtime buffers | Restart PicoBoy; report it if the same title reproduces the error. |
 
 ---
 
-## Adding a Game Boy ROM without an SD card
+## ROM staging and flash safety
 
-For quick testing, you can bake a single **Game Boy** ROM into its own `.uf2` and
-drop it onto PicoBoy next to the firmware — no SD card needed.
+PicoBoy runs one emulator core at a time and stages the selected ROM into onboard
+flash before launching it. In 1.0.4 the ROM window is **not a fixed address**:
+the firmware finds the actual end of its linked image, rounds up to a flash erase
+boundary, leaves a complete guard sector, and uses the remaining space up to the
+settings / NVS sector.
 
-```
-python tools/rom2uf2.py game.gb
-```
+This keeps ROM erase/program operations from overlapping the firmware as PicoBoy
+grows, while still giving every core the same staged-ROM interface.
 
-That produces `game_rom.uf2`. Flash it the same way as the firmware (hold
-**BOOTSEL**, drag it onto **RPI-RP2**), then choose **Load last game**. The ROM
-lands in a separate area of flash from the firmware, so the two don't interfere.
-
-> This path is **Game Boy only**. NES and Atari 2600 games load from the SD card.
+> **1.0.4 note:** the legacy `tools/rom2uf2.py` fixed-offset workflow targets the
+> old `0x80000` staging address and is **not compatible with the dynamic 1.0.4
+> layout**. Use **Browse ROMs** from microSD to stage games.
 
 ---
 
@@ -189,7 +200,7 @@ lands in a separate area of flash from the firmware, so the two don't interfere.
 /src        Main project source
 /firmware   Precompiled UF2
 /images     Project images
-/tools      Tools, scripts (rom2uf2.py) and helpers
+/tools      Development tools and helpers
 /pcb        Gerbers, BOM, and pick-and-place
 /stl        Enclosure files (coming soon)
 ```
@@ -212,6 +223,16 @@ attributions intact if you fork or redistribute.
 - **[pico-infonesPlus](https://github.com/fhoedemakers/pico-infonesPlus)** —
   RP2040/RP2350 InfoNES work by Frank Hoedemakers used as part of PicoBoy's NES
   port lineage. **GPL-3.0**.
+- **[SMS Plus](https://segaretro.org/SMS_Plus)** — Sega Master System and
+  Game Gear emulator by **Charles MacDonald**. The original SMS Plus source was
+  distributed under the GNU General Public License; original notices remain with
+  the adapted core.
+- **[pico-smsplus](https://github.com/fhoedemakers/pico-smsplus)** — RP2040 /
+  RP2350 SMS Plus port by **Frank Hoedemakers (fhoedemakers)** and the direct
+  upstream basis for PicoBoy's Master System / Game Gear integration.
+  **GPL-3.0**.
+- **Z80 CPU core — Juergen Buchmueller** — used by the SMS Plus lineage; original
+  source notices and attribution are retained.
 - **[pico-atari2600](https://github.com/xrip/pico-atari2600)** — Atari 2600
   Raspberry Pi Pico emulator by Ilya Maslennikov. **MIT License**.
 - **[HiFive1-2600](https://github.com/dgrubb/HiFive1-2600)** — original embedded
@@ -226,8 +247,9 @@ attributions intact if you fork or redistribute.
 - **[Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk)** — Raspberry
   Pi Ltd. BSD-3-Clause. (WS2812 LED PIO adapted from `pico-examples`.)
 
-Each third-party component retains its own license; see the respective project
-for full terms. PicoBoy's own source is distributed under GPL-3.0.
+Each third-party component retains its own notices and license terms; see the
+respective project for full terms. PicoBoy's own source is distributed under
+GPL-3.0.
 
 ---
 

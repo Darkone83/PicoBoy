@@ -218,10 +218,10 @@ void InfoNES_pAPUHsync(bool enabled);
 extern int ApuQuality;
 #define pAPU_QUALITY 3
 
-/* Maximum samples produced per Vsync at the highest quality setting.
- * NTSC @ 44100 Hz / 60 Hz = 735; PAL @ 44100 Hz / 50 Hz = 882. Buffers are
- * sized to PAL worst-case so the same allocations cover both regions. */
-#define APU_MAX_SAMPLES_PER_SYNC 882
+/* Per-HSync scratch capacity. At 44.1 kHz NTSC the fixed-point sample
+ * accumulator produces at most 3 samples per HSync; keep one sample of
+ * headroom and clamp the renderer to this bound. */
+#define APU_MAX_SAMPLES_PER_SYNC 4
 
 /*-------------------------------------------------------------------*/
 /*  Rectangle Wave #1 resources                                      */
@@ -302,12 +302,6 @@ void ApuWriteVrc6Freq(WORD addr, BYTE value);
 /*-------------------------------------------------------------------*/
 extern BYTE ApuSunsoft5BEnable;
 extern BYTE (*s5b_wave_buffers)[APU_MAX_SAMPLES_PER_SYNC];
-
-/*-------------------------------------------------------------------*/
-/*  FDS Audio State (defined in InfoNES_FDS.cpp)                     */
-/*-------------------------------------------------------------------*/
-extern BYTE  ApuFdsEnable;
-extern BYTE *fds_wave_buffer;
 
 /*-------------------------------------------------------------------*/
 /*  Sunsoft 5B Audio Write Function                                  */

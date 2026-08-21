@@ -8,13 +8,11 @@
 // core0 emulates + packs each 256-wide line into a ring, core1 DMAs it straight
 // to the panel (interlaced) so core0 never blocks on SPI. In-game pause overlay
 // with brightness/volume/frame-skip and .srm battery saves + .dat save states.
-// The FDS core is present (infones_fds); its disk-swap UI is future work.
 
 #include "InfoNES.h"
 #include "InfoNES_System.h"
 #include "InfoNES_Types.h"
 #include "FrensHelpers.h"
-#include "nes_settings.h"
 
 extern "C" {
 #include "arena.h"
@@ -53,13 +51,10 @@ const WORD NesPalette[64] = {
     0x7FFF, 0x5F9F, 0x675F, 0x733F, 0x7B1F, 0x7F1D, 0x7F39, 0x7B55, 0x7373, 0x6BB3, 0x63B5, 0x5BB8, 0x5BBC, 0x5EF7, 0x0000, 0x0000,
 };
 
-// nes_settings.h global (FDS auto-insert/swap; harmless defaults until the FDS UI lands)
-NesSettings settings = { { true, true } };
-
 // ---------------------------------------------------------------------------
 // Frens:: bump allocator over the shared emulator arena (arena.h). The core
-// f_malloc's RAM/SRAM/PPURAM/SPRRAM/ChrBuf (~64 KB) at Init plus any mapper /
-// FDS buffers on demand. f_free is a no-op; nes_run() rewinds the pointer at
+// f_malloc's RAM/SRAM/PPURAM/SPRRAM/ChrBuf (~64 KB) at Init plus any mapper
+// expansion buffers on demand. f_free is a no-op; nes_run() rewinds the pointer at
 // each launch, so a fresh run always starts from an empty arena.
 // ---------------------------------------------------------------------------
 static uint8_t *s_apos = 0;
@@ -68,7 +63,7 @@ static uint8_t *s_aend = 0;
 static void arena_reset(void)
 {
     s_apos = arena_base();
-    s_aend = arena_base() + ARENA_BYTES;
+    s_aend = arena_base() + ARENA_WORK_BYTES;
 }
 
 void *Frens::f_malloc(size_t size)
@@ -146,7 +141,12 @@ static WORD s_evenrow[NES_FB_W];                      // even line H-averaged, a
 // SPI, so it stays audio-paced at 60. If core1 falls behind, core0 drops the whole
 // frame (produces nothing) instead of stalling -- audio is master, video drops.
 #define NES_RING 8                                     // line buffers in the ring (565 panel bytes)
-static uint8_t   s_ring[NES_RING][NES_STREAM_W * 2];   // core0 converts 555->565 into here; core1 DMAs it
+static uint8_t *s_ring = nullptr;                       // 4 KiB, allocated from shared arena
+
+static inline uint8_t *nes_ring_row(uint32_t index)
+{
+    return s_ring + (index % NES_RING) * (NES_STREAM_W * 2u);
+}
 static volatile uint32_t s_wr = 0;                     // core0: lines produced (monotonic)
 static volatile uint32_t s_rd = 0;                     // core1: lines consumed (monotonic)
 static volatile bool s_frame_done = false;             // core0 -> core1: frame's last line is queued
@@ -256,7 +256,7 @@ static void __not_in_flash_func(core1_stream)(void)
 #endif
             }
             int yrow = NES_STREAM_Y + field + 2 * k;
-            st7789_stream_row_at(NES_STREAM_X, yrow, s_ring[s_rd % NES_RING], NES_STREAM_W);
+            st7789_stream_row_at(NES_STREAM_X, yrow, nes_ring_row(s_rd), NES_STREAM_W);
             k++;
             __sync_synchronize();
             s_rd++;
@@ -287,7 +287,7 @@ static void __not_in_flash_func(core1_stream)(void)
                 st0 = time_us_32();
 #endif
             }
-            const uint8_t *row = s_ring[s_rd % NES_RING];  // already 565 panel bytes (core0 converted)
+            const uint8_t *row = nes_ring_row(s_rd);  // already 565 panel bytes (core0 converted)
             st7789_stream_row(row, NES_STREAM_W);          // waits prev DMA, kicks this one
             __sync_synchronize();
             s_rd++;                                        // release slot (DMA finishes long before reuse)
@@ -385,7 +385,7 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
 #else
         while ((uint32_t)(s_wr - s_rd) >= NES_RING) tight_loop_contents();
 #endif
-        uint8_t *db = s_ring[s_wr % NES_RING];           // convert 555->565 into the next slot
+        uint8_t *db = nes_ring_row(s_wr);           // convert 555->565 into the next slot
         for (int x = 0; x < NES_STREAM_W; x++) {
             WORD v = (WORD)(src[x] & 0x7FFF);
             uint16_t c = (uint16_t)(((v & 0x7FE0) << 1) | (v & 0x1F));
@@ -812,12 +812,35 @@ extern "C" void nes_run(void)
     led_set_state(LED_RUNNING);
     st7789_fill(COL_BLACK);                          // clears the screen incl. pillarbox bars
 
-    InfoNES_SetRegion(INFONES_REGION_NTSC);          // must precede Init (sets scan/APU timing)
     InfoNES_Init();                                  // f_malloc's core buffers + K6502 + scan table
 
     s_next = make_timeout_time_us(NES_FRAME_US);
 
     if (InfoNES_Load("") == 0) {                     // ReadRom (flash) + Reset (banks/mapper)
+#if NES_STREAM_FULLRES
+        // The native scanline ring is NES-only. Put its 4 KiB in the arena; the
+        // APU cleanup already recovered roughly this much arena space.
+        s_ring = (uint8_t *)Frens::f_malloc(NES_RING * NES_STREAM_W * 2u);
+        if (!s_ring) {
+            st7789_fill(g_theme->bg);
+            ui_header("NES");
+            st7789_draw_string(8, 40, "Out of RAM (ring)", g_theme->err, g_theme->bg, 1);
+            ui_footer("B back");
+            led_set_count(4);
+            led_set_state(LED_ERROR);
+            while (true) {
+                buttons_update();
+                if (buttons_pressed() & (1u << BTN_B)) break;
+                sleep_ms(15);
+            }
+            led_set_count(2);
+            InfoNES_Fin();
+            s_ring = nullptr;
+            led_set_state(LED_IDLE);
+            return;
+        }
+        memset(s_ring, 0, NES_RING * NES_STREAM_W * 2u);
+#endif
 #if !NES_STREAM_FULLRES
         // Two 16-bit framebuffers from the arena -> true double-buffer (60K total).
         size_t fbsz = (size_t)NES_FB_W * NES_FB_H * 2u;
@@ -896,5 +919,8 @@ extern "C" void nes_run(void)
 
     led_set_count(2);                                // restore default blink count
     InfoNES_Fin();                                   // f_free's (no-op)
+#if NES_STREAM_FULLRES
+    s_ring = nullptr;
+#endif
     led_set_state(LED_IDLE);
 }

@@ -142,18 +142,12 @@ extern BYTE PPU_UpDown_Clip;
 #define SCAN_ON_SCREEN_START 8
 #define SCAN_BOTTOM_OFF_SCREEN_START 232
 #define SCAN_UNKNOWN_START 240
-// Region-dependent PPU/CPU timing. Set by InfoNES_SetRegion():
-//   NTSC : STEP_PER_SCANLINE=114, STEP_PER_FRAME=29780,
-//          SCAN_VBLANK_START=241, SCAN_VBLANK_END=261  (262 lines @ 60.0988 Hz)
-//   PAL  : STEP_PER_SCANLINE=107, STEP_PER_FRAME=33247,
-//          SCAN_VBLANK_START=241, SCAN_VBLANK_END=311  (312 lines @ 50.007 Hz)
-//   Dendy: STEP_PER_SCANLINE=107, STEP_PER_FRAME=33247,
-//          SCAN_VBLANK_START=291, SCAN_VBLANK_END=311  (312 lines @ 50 Hz,
-//          NTSC-style 21-line vblank — PAL CPU clock with later vblank start)
-extern WORD STEP_PER_SCANLINE;
-extern WORD STEP_PER_FRAME;
-extern WORD SCAN_VBLANK_START;
-extern WORD SCAN_VBLANK_END;
+// PicoBoy NES timing is intentionally NTSC-only. Famicom cartridges use the
+// same timing, and the loader does not expose PAL/Dendy/FDS/NSF media paths.
+#define STEP_PER_SCANLINE 114
+#define STEP_PER_FRAME    29780
+#define SCAN_VBLANK_START 241
+#define SCAN_VBLANK_END   261
 
 /* Develop Scroll Registers */
 #if 0
@@ -305,13 +299,6 @@ extern BYTE ROM_SRAM;
 extern BYTE ROM_Trainer;
 extern BYTE ROM_FourScr;
 
-/* True when the loaded image is a Famicom Disk System disk (no iNES header).
-   Set by parseROM in main before InfoNES_Reset. RP2350 + PSRAM only. */
-extern bool IsFDS;
-
-/* True when the loaded image is an NSF (Nintendo Sound Format) file. */
-extern bool IsNSF;
-
 /*-------------------------------------------------------------------*/
 /*  Function prototypes                                              */
 /*-------------------------------------------------------------------*/
@@ -333,26 +320,6 @@ void InfoNES_SetupPPU();
 
 /* Set up a Mirroring of Name Table */
 void InfoNES_Mirroring(int nType);
-
-/* Region selectors for InfoNES_SetRegion() / InfoNES_Main(). */
-#define INFONES_REGION_NTSC  0
-#define INFONES_REGION_PAL   1
-#define INFONES_REGION_DENDY 2
-
-/* The main loop of InfoNES. region: 0=NTSC, 1=PAL, 2=Dendy. */
-void InfoNES_Main(int region);
-
-/* Select region (0/1/2) for timing. Must be called before InfoNES_Init() /
-   InfoNES_pAPUInit() so region-dependent constants are picked up.
-   InfoNES_Main() calls this for you. */
-void InfoNES_SetRegion(int region);
-
-/* Returns the currently selected region (0/1/2). */
-int InfoNES_GetRegion();
-
-/* True for PAL or Dendy (anything that uses the PAL CPU clock + 50 Hz pacing
-   + PAL APU period tables). Used by audio init and frame pacing. */
-bool InfoNES_IsPal();
 
 /* The loop of emulation */
 void InfoNES_Cycle();

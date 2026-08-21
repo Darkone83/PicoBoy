@@ -131,6 +131,14 @@ static const about_credit_t ABOUT_CREDITS[] = {
     { "pico-infonesPlus - fhoedemakers",  0 },
     { "",                                 0 },
 
+    { "MASTER SYSTEM / GAME GEAR",       1 },
+    { "SMS Plus - Charles MacDonald",      0 },
+    { "pico-smsplus - fhoedemakers",       0 },
+    { "pico-smsplus: GPL-3.0",             2 },
+    { "Z80 core - Juergen Buchmueller",    0 },
+    { "RP2040: PSG audio (no YM2413 FM)",  2 },
+    { "",                                 0 },
+
     { "ATARI 2600",                       1 },
     { "pico-atari2600",                   0 },
     { "Ilya Maslennikov - MIT",           0 },

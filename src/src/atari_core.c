@@ -31,6 +31,12 @@
 #define ATARI_PALETTE_BYTES (128u * sizeof(uint16_t))
 #define ATARI_WORK_BYTES (2u * ATARI_FB_BYTES)
 
+// Stella uses phosphor persistence to tame intentional alternating-frame
+// flicker used by a number of 2600 kernels.  Keep a compact RGB332 history
+// (one byte per native TIA pixel) so PicoBoy can apply the same raise-fast /
+// decay-slow idea without adding another 16-bit framebuffer.
+#define ATARI_PHOSPHOR_BYTES ATARI_FB_BYTES
+
 #define ATARI_DST_W 256
 #define ATARI_DST_H 192
 #define ATARI_DST_X ((LCD_W - ATARI_DST_W) / 2)   // 32
@@ -41,7 +47,42 @@
 static uint32_t s_rom_size = 0;
 static uint8_t *s_fb[2];
 static const uint16_t *s_palette565 = atari_tia_palette565;
+static uint8_t *s_phosphor_rgb332 = NULL;
 static volatile bool s_core1_busy = false;
+
+static inline uint8_t rgb565_to_rgb332(uint16_t p) {
+    uint8_t r = (uint8_t)((p >> 13) & 0x07u);
+    uint8_t g = (uint8_t)((p >> 8)  & 0x07u);
+    uint8_t b = (uint8_t)((p >> 3)  & 0x03u);
+    return (uint8_t)((r << 5) | (g << 2) | b);
+}
+
+static inline uint16_t phosphor_pixel(uint16_t current, uint8_t *history) {
+    const uint8_t h = *history;
+
+    // Expand RGB332 history back toward RGB565 precision, then apply Stella's
+    // default 50% phosphor decay.  Each channel rises immediately when the
+    // current frame is brighter and otherwise falls by half per frame.
+    uint8_t pr = (uint8_t)((h >> 5) & 0x07u);
+    uint8_t pg = (uint8_t)((h >> 2) & 0x07u);
+    uint8_t pb = (uint8_t)(h & 0x03u);
+
+    pr = (uint8_t)(((pr << 2) | (pr >> 1)) >> 1);
+    pg = (uint8_t)(((pg << 3) | pg) >> 1);
+    pb = (uint8_t)(((pb << 3) | (pb << 1) | (pb >> 1)) >> 1);
+
+    uint8_t cr = (uint8_t)((current >> 11) & 0x1Fu);
+    uint8_t cg = (uint8_t)((current >> 5)  & 0x3Fu);
+    uint8_t cb = (uint8_t)(current & 0x1Fu);
+
+    if (pr > cr) cr = pr;
+    if (pg > cg) cg = pg;
+    if (pb > cb) cb = pb;
+
+    const uint16_t out = (uint16_t)((cr << 11) | (cg << 5) | cb);
+    *history = rgb565_to_rgb332(out);
+    return out;
+}
 
 void atari_core_set_rom_size(uint32_t size) { s_rom_size = size; }
 
@@ -95,10 +136,20 @@ static void __not_in_flash_func(atari_core1_display)(void) {
 
         for (int y = 0; y < ATARI_DST_H; y++) {
             const uint8_t *srow = &src[y * ATARI_FB_W];
+            uint8_t *hrow = &s_phosphor_rgb332[y * ATARI_FB_W];
             uint8_t *dst = row[rb];
 
+            // xmap is monotonic, so each native TIA pixel is blended exactly
+            // once even though the 160-wide image is expanded to 256 pixels.
+            int last_sx = -1;
+            uint16_t p = 0;
             for (int x = 0; x < ATARI_DST_W; x++) {
-                uint16_t p = s_palette565[srow[xmap[x]] & 0x7F];
+                int sx = xmap[x];
+                if (sx != last_sx) {
+                    uint16_t cur = s_palette565[srow[sx] & 0x7F];
+                    p = phosphor_pixel(cur, &hrow[sx]);
+                    last_sx = sx;
+                }
                 dst[x * 2]     = (uint8_t)(p >> 8);
                 dst[x * 2 + 1] = (uint8_t)p;
             }
@@ -534,9 +585,10 @@ void atari_core_run(void) {
     // exists for the mutually-exclusive emulator cores.
     const uint32_t palette_pad = (uint32_t)((s_rom_size + 1u) & ~1u);
     const uint32_t workspace_needed =
-        ATARI_WORK_BYTES + palette_pad + ATARI_PALETTE_BYTES;
+        ATARI_WORK_BYTES + palette_pad + ATARI_PALETTE_BYTES +
+        ATARI_PHOSPHOR_BYTES;
 
-    if (!s_rom_size || workspace_needed > ARENA_BYTES) {
+    if (!s_rom_size || workspace_needed > ARENA_WORK_BYTES) {
         show_error("Atari ROM too large", "");
         return;
     }
@@ -547,9 +599,11 @@ void atari_core_run(void) {
     uint8_t *rom_ram = arena + ATARI_WORK_BYTES;
     uint16_t *palette_ram =
         (uint16_t *)(rom_ram + palette_pad);
+    s_phosphor_rgb332 = (uint8_t *)palette_ram + ATARI_PALETTE_BYTES;
 
     memcpy(rom_ram, rom_flash, s_rom_size);
     memcpy(palette_ram, atari_tia_palette565, ATARI_PALETTE_BYTES);
+    memset(s_phosphor_rgb332, 0, ATARI_PHOSPHOR_BYTES);
     s_palette565 = palette_ram;
 
     if (!atari_cart_mount(rom_ram, s_rom_size)) {

@@ -12,9 +12,9 @@ BYTE  Map69_Regs[ 1 ];
  * then a data byte is written via $E000. */
 BYTE  Map69_5B_Reg;
 
-/* Sunsoft 5B wave buffers (3 tone channels × APU_MAX_SAMPLES_PER_SYNC samples
- * per Vsync — 735 NTSC, 882 PAL). Allocated in Map69_Init only when this
- * mapper is loaded, freed in InfoNES_pAPUDone. */
+/* Sunsoft 5B wave buffers (3 tone channels × per-HSync scratch samples).
+ * Allocated in Map69_Init only when this mapper is loaded and freed in
+ * InfoNES_pAPUDone. */
 BYTE (*s5b_wave_buffers)[APU_MAX_SAMPLES_PER_SYNC];
 
 /*-------------------------------------------------------------------*/

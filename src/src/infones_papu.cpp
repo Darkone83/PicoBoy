@@ -14,7 +14,6 @@
 #include "InfoNES.h"
 #include "InfoNES_System.h"
 #include "InfoNES_pAPU.h"
-#include "InfoNES_FDS.h"
 #include "FrensHelpers.h"
 #include <algorithm>
 #include <string.h>
@@ -119,7 +118,7 @@ ApuWritefunc pAPUSoundRegs[20] =
 /*   APU resources                                                   */
 /*-------------------------------------------------------------------*/
 
-BYTE (*wave_buffers)[APU_MAX_SAMPLES_PER_SYNC]; /* PAL worst case: 44100/50 = 882 */
+BYTE (*wave_buffers)[APU_MAX_SAMPLES_PER_SYNC]; /* per-HSync scratch; 44.1 kHz NTSC needs at most 3 samples */
 
 
 BYTE ApuCtrl;
@@ -155,21 +154,6 @@ struct ApuQualityData_t
     {0xa2567000, 0xa2567000, 0xa2567000, 45963, 164, 11025, 664935},
     {0x512b3800, 0x512b3800, 0x512b3800, 91926, 82, 22050, 1329870},
     {0x289d9c00, 0x289d9c00, 0x289d9c00, 184402, 41, 44100, 2659741},
-};
-
-// PAL ApuQual: CPU clock 1.662607 MHz, 50.007 Hz, 312 scanlines.
-//   magic: scaled by ratio 1662607/1789773 = 0.928953 (CPU-clock dependent).
-//   samples_per_sync_16: per-Hsync, sample_rate*65536 / (50 * 312).
-//     44100/50/312*65536 = 185262.77; 22050/50/312*65536 = 92631.38;
-//     11025/50/312*65536 = 46315.69
-//   cycles_per_sample: round(1662607 / sample_rate).
-//   cycle_rate: 1662607 / sample_rate * 65536
-//     1662607/44100*65536 = 2470797.9; 1662607/22050*65536 = 1235398.95;
-//     1662607/11025*65536 = 617699.5
-ApuQualityData_t ApuQualPal[] = {
-    {0x96D5DA00, 0x96D5DA00, 0x96D5DA00, 46316, 151, 11025, 617700},
-    {0x4B6AED00, 0x4B6AED00, 0x4B6AED00, 92631, 75, 22050, 1235399},
-    {0x25C5E680, 0x25C5E680, 0x25C5E680, 185263, 38, 44100, 2470798},
 };
 
 // 44100/60/262*65536 = 183850.99236641222
@@ -582,35 +566,20 @@ WORD __not_in_flash_func(ApuFreqLimit)[8] =
         0x3FF, 0x555, 0x666, 0x71C, 0x787, 0x7C1, 0x7E0, 0x7F0};
 
 /*-------------------------------------------------------------------*/
-/* Noise Frequency Lookup Tables (NTSC + PAL)                        */
+/* NTSC noise and DMC period lookup tables                           */
 /*-------------------------------------------------------------------*/
 static DWORD __not_in_flash_func(ApuNoiseFreqNtsc)[16] =
     {
         4, 8, 16, 32, 64, 96, 128, 160,
         202, 254, 380, 508, 762, 1016, 2034, 4068};
 
-static DWORD __not_in_flash_func(ApuNoiseFreqPal)[16] =
-    {
-        4, 8, 14, 30, 60, 88, 118, 148,
-        188, 236, 354, 472, 708, 944, 1890, 3778};
-
-/* Active noise period table; selected by region in InfoNES_pAPUInit(). */
 DWORD *ApuNoiseFreq = ApuNoiseFreqNtsc;
 
-/*-------------------------------------------------------------------*/
-/* DMC Transfer Clocks Tables (NTSC + PAL)                           */
-/*-------------------------------------------------------------------*/
 static DWORD __not_in_flash_func(ApuDpcmCyclesNtsc)[16] =
     {
         428, 380, 340, 320, 286, 254, 226, 214,
         190, 160, 142, 128, 106, 85, 72, 54};
 
-static DWORD __not_in_flash_func(ApuDpcmCyclesPal)[16] =
-    {
-        398, 354, 316, 298, 276, 236, 210, 198,
-        176, 148, 132, 118, 98, 78, 66, 50};
-
-/* Active DMC period table; selected by region in InfoNES_pAPUInit(). */
 DWORD *ApuDpcmCycles = ApuDpcmCyclesNtsc;
 
 /*===================================================================*/
@@ -711,7 +680,7 @@ void __not_in_flash_func(ApuRenderingWave1)(int n)
   }
   else
   {
-    memset(wave_buffers[0], 0, 2 * n);
+    memset(wave_buffers[0], 0, n);
   }
 }
 
@@ -812,7 +781,7 @@ void __not_in_flash_func(ApuRenderingWave2)(int n)
   }
   else
   {
-    memset(wave_buffers[1], 0, 2 * n);
+    memset(wave_buffers[1], 0, n);
   }
 }
 
@@ -905,7 +874,7 @@ void __not_in_flash_func(ApuRenderingWave3)(int n)
   }
   else
   {
-    memset(wave_buffers[2], 0, 2 * n);
+    memset(wave_buffers[2], 0, n);
   }
 }
 
@@ -1033,7 +1002,7 @@ void __not_in_flash_func(ApuRenderingWave4)(int n)
   }
   else
   {
-    memset(wave_buffers[3], 0, n << 1);
+    memset(wave_buffers[3], 0, n);
   }
 }
 
@@ -1980,14 +1949,9 @@ void __not_in_flash_func(InfoNES_pAPUHsync)(bool enabled)
 
   int bufferLeft = InfoNES_GetSoundBufferSize();
   n = std::min<int>(bufferLeft, n);
+  n = std::min<int>(n, APU_MAX_SAMPLES_PER_SYNC);
 
-  /* In NSF mode, skip audio rendering when playback is stopped — otherwise
-     expansion-chip oscillators (VRC6 in particular) keep regenerating their
-     buffers from preserved phase state and the last tone bleeds through B's
-     stop until a new track starts. The else-branch zeros every output buffer
-     SoundOutput touches so stale samples can't leak via wave6 either. */
-  extern bool NsfIsPlaying;
-  if (enabled && (!IsNSF || NsfIsPlaying))
+  if (enabled)
   {
     ApuRenderingWave1(n);
     ApuRenderingWave2(n);
@@ -2026,16 +1990,6 @@ void __not_in_flash_func(InfoNES_pAPUHsync)(bool enabled)
       }
     }
 
-    /* Render and mix FDS expansion audio (wavetable + modulation).
-     * FDS audio is passed as the wave6 channel (shared with S5B, which
-     * is mutually exclusive since they're different mappers). This
-     * ensures FDS audio is mixed equally into L and R (mono) rather
-     * than being biased toward the pulse-1 stereo side. */
-    if (ApuFdsEnable)
-    {
-      fdsRenderAudio(n);
-    }
-
     /* Render Sunsoft 5B expansion audio (Mapper 69 — Gimmick!, Hebereke) into
      * its OWN output buffer.
      *
@@ -2064,20 +2018,16 @@ void __not_in_flash_func(InfoNES_pAPUHsync)(bool enabled)
     memset(&wave_buffers[2][0], 0, n);
     memset(&wave_buffers[3][0], 0, n);
     memset(&wave_buffers[4][0], 0, n);
-    /* SoundOutput's wave6 reads s5b_wave_buffers[0] or fds_wave_buffer
-       depending on which expansion is enabled — zero those too so stopped
-       NSF (or muted APU) doesn't bleed expansion audio into the output. */
+    /* Clear optional expansion buffers too when the APU is muted. */
     if (vrc6_wave_buffers) memset(&vrc6_wave_buffers[0][0], 0, n);
     if (s5b_wave_buffers) memset(&s5b_wave_buffers[0][0], 0, n);
-    if (fds_wave_buffer)  memset(fds_wave_buffer, 0, n);
   }
 
   InfoNES_SoundOutput(n,
                       wave_buffers[0], wave_buffers[1], wave_buffers[2],
                       wave_buffers[3], wave_buffers[4],
                       ApuVrc6Enable ? vrc6_wave_buffers[0] :
-                      (ApuSunsoft5BEnable ? s5b_wave_buffers[0] :
-                      (ApuFdsEnable ? fds_wave_buffer : nullptr)));
+                      (ApuSunsoft5BEnable ? s5b_wave_buffers[0] : nullptr));
 
 
   entertime = getPassedClocks();
@@ -2097,10 +2047,7 @@ void InfoNES_pAPUInit(void)
 
   ApuQuality = pAPU_QUALITY - 1; // 1: 22050, 2: 44100 [samples/sec]
 
-  /* Pick the per-region quality table and period tables. */
-  ApuQualityData_t *qual = InfoNES_IsPal() ? ApuQualPal : ApuQual;
-  ApuNoiseFreq        = InfoNES_IsPal() ? ApuNoiseFreqPal  : ApuNoiseFreqNtsc;
-  ApuDpcmCycles       = InfoNES_IsPal() ? ApuDpcmCyclesPal : ApuDpcmCyclesNtsc;
+  ApuQualityData_t *qual = ApuQual;
 
   ApuPulseMagic = qual[ApuQuality].pulse_magic;
   ApuTriangleMagic = qual[ApuQuality].triangle_magic;
@@ -2194,11 +2141,6 @@ void InfoNES_pAPUInit(void)
   ApuVrc6SawPhaseAcc = 0;
 
   /*-------------------------------------------------------------------*/
-  /*   Initialize FDS Audio                                            */
-  /*-------------------------------------------------------------------*/
-  ApuFdsEnable = 0;
-
-  /*-------------------------------------------------------------------*/
   /*   Initialize Sunsoft 5B Audio                                     */
   /*-------------------------------------------------------------------*/
   ApuSunsoft5BEnable = 0;
@@ -2242,7 +2184,6 @@ void InfoNES_pAPUDone(void)
   if (mmc5_wave_buffers) { Frens::f_free(mmc5_wave_buffers); mmc5_wave_buffers = nullptr; }
 #endif
   if (vrc6_wave_buffers) { Frens::f_free(vrc6_wave_buffers); vrc6_wave_buffers = nullptr; }
-  if (fds_wave_buffer) { Frens::f_free(fds_wave_buffer); fds_wave_buffer = nullptr; }
   if (s5b_wave_buffers) { Frens::f_free(s5b_wave_buffers); s5b_wave_buffers = nullptr; }
 }
 
