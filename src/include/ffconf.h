@@ -12,7 +12,7 @@
 #define FF_FS_MINIMIZE	0
 #define FF_USE_FIND		0
 #define FF_USE_MKFS		0	/* card is formatted on a PC */
-#define FF_USE_FASTSEEK	0
+#define FF_USE_FASTSEEK	1
 #define FF_USE_EXPAND	0
 #define FF_USE_CHMOD	0
 #define FF_USE_LABEL	0

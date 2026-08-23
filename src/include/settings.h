@@ -9,6 +9,9 @@ typedef struct {
     int8_t  frameskip;       // -1 = auto (show when ready), 0..5 = fixed frames skipped
     uint8_t theme;           // index into the built-in theme table (theme.h)
     uint8_t screensaver;     // 0 = off, 1 = on (idle animation on the menus)
+    uint8_t gg_scaled;       // Game Gear display: 0 = Native, 1 = Scaled (240x216)
+    uint8_t nes_scaled;      // NES display: 0 = Native, 1 = Scaled (~8:7 aspect, 293x232)
+    uint8_t usb_sd_access;   // 0 = charge-only USB, 1 = expose SD as USB MSC from main menu
 } settings_t;
 
 extern settings_t g_settings;
@@ -16,4 +19,4 @@ extern settings_t g_settings;
 void settings_init(void);    // load from NVS flash, or defaults on first boot / version mismatch
 void settings_apply(void);   // push current settings to hardware (backlight, LED)
 void settings_menu(void);    // interactive settings screen (saves to NVS on exit if changed)
-void settings_save(void);    // persist current settings to NVS (used by the in-game overlay too)
+void settings_save(void);    // persist current settings to NVS (used by the in-game overlay to

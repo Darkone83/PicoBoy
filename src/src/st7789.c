@@ -359,6 +359,73 @@ void st7789_stream_end(void) {
     cs(false);
 }
 
+static inline uint16_t rgb565_avg_round(uint16_t a, uint16_t b) {
+    // Exact rounded average of the independent 5/6/5 fields without unpacking.
+    uint16_t x = (uint16_t)(a ^ b);
+    return (uint16_t)((a & b) +
+                      ((x & 0xF7DEu) >> 1) +
+                      (x & 0x0821u));
+}
+
+// Horizontal ~8:7 aspect correction for native packed RGB565 rows.
+// Uses the driver's existing 640-byte scratch line; no new row buffer is added.
+// All source pixels are kept and the extra pixels are averages of neighbours.
+static int st7789_pack_row_8_7(uint8_t *dst, const uint8_t *src, int src_w) {
+    if (src_w <= 1) return 0;
+
+    const int dst_w = (src_w * 8 + 3) / 7;   // 256 -> 293
+    if (dst_w > LCD_W) return 0;
+
+    const int inserts = dst_w - src_w;
+    const int bounds = src_w - 1;
+    int phase = bounds / 2;
+    int ox = 0;
+
+    for (int x = 0; x < src_w; x++) {
+        uint16_t a = (uint16_t)(((uint16_t)src[x * 2] << 8) | src[x * 2 + 1]);
+        dst[ox * 2] = (uint8_t)(a >> 8);
+        dst[ox * 2 + 1] = (uint8_t)a;
+        ox++;
+
+        if (x + 1 < src_w) {
+            phase += inserts;
+            if (phase >= bounds) {
+                phase -= bounds;
+                uint16_t b = (uint16_t)(((uint16_t)src[(x + 1) * 2] << 8) |
+                                                    src[(x + 1) * 2 + 1]);
+                uint16_t m = rgb565_avg_round(a, b);
+                dst[ox * 2] = (uint8_t)(m >> 8);
+                dst[ox * 2 + 1] = (uint8_t)m;
+                ox++;
+            }
+        }
+    }
+    return ox;
+}
+
+// Already-open RAMWR stream variant (used only if NES_INTERLACE is disabled).
+void st7789_stream_row_8_7(const uint8_t *row, int src_w) {
+    blit_dma_init();
+    dma_channel_wait_for_finish_blocking(s_blit_dma);
+    int out_w = st7789_pack_row_8_7(s_scratch.lines[0], row, src_w);
+    if (out_w > 0)
+        dma_channel_transfer_from_buffer_now(s_blit_dma, s_scratch.lines[0], (uint)(out_w * 2));
+}
+
+// Interlaced NES path: pack into the existing scratch row, send one explicit row,
+// and block until transfer completes so the scratch is immediately reusable.
+void st7789_stream_row_8_7_at(int x, int y, const uint8_t *row, int src_w) {
+    blit_dma_init();
+    int out_w = st7789_pack_row_8_7(s_scratch.lines[0], row, src_w);
+    if (out_w <= 0) return;
+    set_window(x, y, x + out_w - 1, y);
+    dc(true); cs(true);
+    dma_channel_transfer_from_buffer_now(s_blit_dma, s_scratch.lines[0], (uint)(out_w * 2));
+    dma_channel_wait_for_finish_blocking(s_blit_dma);
+    while (spi_is_busy(LCD_SPI)) tight_loop_contents();
+    cs(false);
+}
+
 // Stream one already-packed 565 row to a specific panel row via DMA. Used by the
 // interlaced full-res path: rows aren't contiguous (every other line), so each
 // gets its own 1-row window. Same set_window + dc/cs pattern as the field blit.

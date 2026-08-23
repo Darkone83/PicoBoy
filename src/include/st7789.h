@@ -42,6 +42,9 @@ void st7789_blit_scaled_dma(int dx, int dy, int dst_w, int dst_h,
 void st7789_stream_begin(int x, int y, int w, int h);
 void st7789_stream_row(const uint8_t *row, int w);
 void st7789_stream_end(void);
+// Horizontal 8:7-style row expansion using existing LCD scratch storage.
+void st7789_stream_row_8_7(const uint8_t *row, int src_w);
+void st7789_stream_row_8_7_at(int x, int y, const uint8_t *row, int src_w);
 // Interlaced full-res path: stream one packed 565 row to an explicit panel row.
 void st7789_stream_row_at(int x, int y, const uint8_t *row, int w);
 

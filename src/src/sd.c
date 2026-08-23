@@ -9,7 +9,7 @@
 // CS is driven manually (GPIO), the usual approach for SD in SPI mode.
 
 #define SD_INIT_HZ  (400u * 1000u)        // <=400 kHz during init, per spec
-#define SD_FAST_HZ  (12u * 1000u * 1000u) // conservative post-init clock for breadboard jumpers
+#define SD_FAST_HZ  (50u * 1000u * 1000u) // request ~50 MHz; at 296 MHz clk_peri RP2040 selects ~49.33 MHz
 
 static inline void cs_high(void) { gpio_put(SD_CS_PIN, 1); }
 static inline void cs_low(void)  { gpio_put(SD_CS_PIN, 0); }
@@ -25,6 +25,18 @@ static uint8_t sd_xfer(uint8_t b) {
     return rx;
 }
 
+// Bulk transfers use the RP2040 SPI FIFO in one SDK call instead of calling
+// spi_write_read_blocking(..., 1) once per byte.  This is especially important
+// for 512-byte SD payloads: the previous path paid C/SDK call overhead 512
+// times for every sector transferred.
+static inline void sd_read_bulk(uint8_t *dst, size_t len) {
+    spi_read_blocking(SD_SPI, 0xFF, dst, len);
+}
+
+static inline void sd_write_bulk(const uint8_t *src, size_t len) {
+    spi_write_blocking(SD_SPI, src, len);
+}
+
 // Send a 6-byte command, return R1 (first response byte with bit7 clear).
 static uint8_t sd_cmd(uint8_t cmd, uint32_t arg, uint8_t crc) {
     sd_xfer(0xFF); // flush
@@ -33,7 +45,7 @@ static uint8_t sd_cmd(uint8_t cmd, uint32_t arg, uint8_t crc) {
         (uint8_t)(arg >> 24), (uint8_t)(arg >> 16),
         (uint8_t)(arg >> 8),  (uint8_t)(arg), crc
     };
-    for (int i = 0; i < 6; i++) sd_xfer(f[i]);
+    sd_write_bulk(f, sizeof f);
     uint8_t r1 = 0xFF;
     for (int i = 0; i < 8; i++) { r1 = sd_xfer(0xFF); if (!(r1 & 0x80)) break; }
     return r1;
@@ -75,7 +87,7 @@ bool sd_init(sd_info_t *info) {
     r1 = sd_cmd(8, 0x000001AA, 0x87);
     if (r1 == 0x01) {
         uint8_t r7[4];
-        for (int i = 0; i < 4; i++) r7[i] = sd_xfer(0xFF);
+        sd_read_bulk(r7, sizeof r7);
         if (r7[2] == 0x01 && r7[3] == 0xAA) v2 = true;  // 2.7-3.6V + echo matches
     }
 
@@ -92,7 +104,7 @@ bool sd_init(sd_info_t *info) {
         r1 = sd_cmd(58, 0, 0xFF);
         if (r1 == 0x00) {
             uint8_t ocr[4];
-            for (int i = 0; i < 4; i++) ocr[i] = sd_xfer(0xFF);
+            sd_read_bulk(ocr, sizeof ocr);
             hc = (ocr[0] & 0x40) != 0;
         }
         type = hc ? SD_V2_SDHC : SD_V2_SDSC;
@@ -108,8 +120,9 @@ bool sd_init(sd_info_t *info) {
         for (int i = 0; i < 50000; i++) { tok = sd_xfer(0xFF); if (tok != 0xFF) break; }
         if (tok == 0xFE) {
             uint8_t csd[16];
-            for (int i = 0; i < 16; i++) csd[i] = sd_xfer(0xFF);
-            sd_xfer(0xFF); sd_xfer(0xFF);  // discard CRC
+            sd_read_bulk(csd, sizeof csd);
+            uint8_t crc[2];
+            sd_read_bulk(crc, sizeof crc);  // discard CRC
             if ((csd[0] >> 6) == 1) {
                 // CSD v2 (SDHC/SDXC): C_SIZE = bits[69:48]; capacity = (C_SIZE+1) * 512 KB.
                 uint32_t c_size = ((uint32_t)(csd[7] & 0x3F) << 16)
@@ -155,39 +168,186 @@ static bool wait_not_busy(uint32_t tries) {
     return false;
 }
 
-bool sd_read_blocks(uint8_t *buf, uint32_t lba, uint32_t count) {
-    if (!s_ready) return false;
-    cs_low();
-    bool ok = true;
-    for (uint32_t b = 0; b < count; b++) {
-        if (sd_cmd(17, addr_of(lba + b), 0xFF) != 0x00) { ok = false; break; }  // CMD17 READ_SINGLE_BLOCK
-        uint8_t tok = 0xFF;
-        for (int i = 0; i < 200000; i++) { tok = sd_xfer(0xFF); if (tok != 0xFF) break; }
-        if (tok != 0xFE) { ok = false; break; }                                  // data start token
-        uint8_t *p = buf + (size_t)b * 512u;
-        for (uint32_t i = 0; i < 512; i++) p[i] = sd_xfer(0xFF);
-        sd_xfer(0xFF); sd_xfer(0xFF);                                            // discard CRC
+// Stop an active CMD18 READ_MULTIPLE_BLOCK stream.
+//
+// CMD12 is special in SPI mode: the card returns one stuff byte before the R1
+// response. After the R1 response it may hold MISO low while terminating the
+// stream, so wait until the card releases the bus before deselecting it.
+static bool sd_stop_read_multi(void) {
+    const uint8_t f[6] = {
+        (uint8_t)(0x40u | 12u), 0, 0, 0, 0, 0xFF
+    };
+
+    // Do not use sd_cmd() here: CMD12 has the extra stuff byte and an R1b-style
+    // busy phase that ordinary commands do not.
+    sd_write_bulk(f, sizeof f);
+
+    (void)sd_xfer(0xFF);  // mandatory CMD12 stuff byte
+
+    uint8_t r1 = 0xFF;
+    for (int i = 0; i < 16; i++) {
+        r1 = sd_xfer(0xFF);
+        if (!(r1 & 0x80))
+            break;
     }
+
+    if (r1 != 0x00)
+        return false;
+
+    return wait_not_busy(200000u);
+}
+
+bool sd_read_blocks(uint8_t *buf, uint32_t lba, uint32_t count) {
+    if (!s_ready || !buf || count == 0)
+        return false;
+
+    cs_low();
+
+    // Preserve the already-validated single-sector path exactly. This keeps
+    // metadata reads, USB's common 512-byte accesses, and other small I/O on
+    // CMD17 while allowing FatFs contiguous reads to use a streaming command.
+    if (count == 1) {
+        bool ok = true;
+
+        if (sd_cmd(17, addr_of(lba), 0xFF) != 0x00) {
+            ok = false;
+        } else {
+            uint8_t tok = 0xFF;
+            for (int i = 0; i < 200000; i++) {
+                tok = sd_xfer(0xFF);
+                if (tok != 0xFF)
+                    break;
+            }
+
+            if (tok != 0xFE) {
+                ok = false;
+            } else {
+                sd_read_bulk(buf, 512u);
+                uint8_t crc[2];
+                sd_read_bulk(crc, sizeof crc);  // discard CRC
+            }
+        }
+
+        cs_high();
+        sd_xfer(0xFF);
+        return ok;
+    }
+
+    // Contiguous multi-sector read: issue one CMD18 and keep CS asserted while
+    // the card streams each 512-byte block. A 16 KiB GBC cache fill becomes one
+    // command + 32 data blocks instead of 32 independent CMD17 transactions.
+    bool ok = (sd_cmd(18, addr_of(lba), 0xFF) == 0x00);
+
+    if (ok) {
+        for (uint32_t b = 0; b < count; b++) {
+            uint8_t tok = 0xFF;
+
+            for (int i = 0; i < 200000; i++) {
+                tok = sd_xfer(0xFF);
+                if (tok != 0xFF)
+                    break;
+            }
+
+            if (tok != 0xFE) {
+                ok = false;
+                break;
+            }
+
+            uint8_t *p = buf + (size_t)b * 512u;
+            sd_read_bulk(p, 512u);
+
+            uint8_t crc[2];
+            sd_read_bulk(crc, sizeof crc);  // discard CRC
+        }
+
+        // Once CMD18 has been accepted, always terminate the stream even if a
+        // later data token timed out. This leaves the card in a defined state
+        // for the next filesystem request.
+        if (!sd_stop_read_multi())
+            ok = false;
+    }
+
     cs_high();
     sd_xfer(0xFF);
     return ok;
 }
 
 bool sd_write_blocks(const uint8_t *buf, uint32_t lba, uint32_t count) {
-    if (!s_ready) return false;
+    if (!s_ready || !buf || count == 0)
+        return false;
+
     cs_low();
-    bool ok = true;
-    for (uint32_t b = 0; b < count; b++) {
-        if (sd_cmd(24, addr_of(lba + b), 0xFF) != 0x00) { ok = false; break; }   // CMD24 WRITE_BLOCK
-        sd_xfer(0xFF);                                                           // 1-byte gap
-        sd_xfer(0xFE);                                                           // data start token
-        const uint8_t *p = buf + (size_t)b * 512u;
-        for (uint32_t i = 0; i < 512; i++) sd_xfer(p[i]);
-        sd_xfer(0xFF); sd_xfer(0xFF);                                            // dummy CRC
-        uint8_t resp = sd_xfer(0xFF);
-        if ((resp & 0x1F) != 0x05) { ok = false; break; }                       // data-accepted token
-        if (!wait_not_busy(2000000)) { ok = false; break; }                     // card programs the block
+
+    // Preserve the proven single-sector path.
+    if (count == 1) {
+        bool ok = true;
+
+        if (sd_cmd(24, addr_of(lba), 0xFF) != 0x00) {
+            ok = false;
+        } else {
+            sd_xfer(0xFF);              // 1-byte gap
+            sd_xfer(0xFE);              // single-block data start token
+            sd_write_bulk(buf, 512u);
+
+            const uint8_t crc[2] = { 0xFF, 0xFF };
+            sd_write_bulk(crc, sizeof crc);
+
+            uint8_t resp = sd_xfer(0xFF);
+            if ((resp & 0x1F) != 0x05)
+                ok = false;
+            else if (!wait_not_busy(2000000u))
+                ok = false;
+        }
+
+        cs_high();
+        sd_xfer(0xFF);
+        return ok;
     }
+
+    // Give SD cards a hint about the upcoming multi-block write count. ACMD23
+    // is an optimization hint; cards that reject it still proceed with CMD25.
+    (void)sd_cmd(55, 0, 0xFF);
+    (void)sd_cmd(23, count, 0xFF);      // ACMD23 SET_WR_BLK_ERASE_COUNT
+
+    bool started = (sd_cmd(25, addr_of(lba), 0xFF) == 0x00);  // WRITE_MULTIPLE_BLOCK
+    bool ok = started;
+
+    if (started) {
+        for (uint32_t b = 0; b < count; b++) {
+            if (!wait_not_busy(2000000u)) {
+                ok = false;
+                break;
+            }
+
+            sd_xfer(0xFC);              // multi-block write data token
+
+            const uint8_t *p = buf + (size_t)b * 512u;
+            sd_write_bulk(p, 512u);
+
+            const uint8_t crc[2] = { 0xFF, 0xFF };
+            sd_write_bulk(crc, sizeof crc);
+
+            uint8_t resp = sd_xfer(0xFF);
+            if ((resp & 0x1F) != 0x05) {
+                ok = false;
+                break;
+            }
+
+            // Do not start the next block until the card finishes programming
+            // the current one.
+            if (!wait_not_busy(2000000u)) {
+                ok = false;
+                break;
+            }
+        }
+
+        // Once CMD25 is accepted, always terminate the multi-block stream even
+        // after a later block failure so the card returns to command state.
+        sd_xfer(0xFD);                  // STOP_TRAN token
+        if (!wait_not_busy(2000000u))
+            ok = false;
+    }
+
     cs_high();
     sd_xfer(0xFF);
     return ok;

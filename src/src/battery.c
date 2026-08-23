@@ -5,12 +5,6 @@
 #ifdef VBAT_SENSE_PIN
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
-#include <stdio.h>
-
-// ===========================================================================
-//  CALIBRATION  --  enable BATTERY_DEBUG to see raw/mV/%/state over USB serial.
-// ===========================================================================
-#define BATTERY_DEBUG          0      // 1 = printf each poll (USB CDC)
 
 #define VBAT_ADC_CH            3      // ADC3 == GPIO29 (VBAT_SENSE_PIN)
 #define VREF_MV               3300u   // ADC reference; measure your 3V3 and set exactly
@@ -91,10 +85,6 @@ static bool poll(repeating_timer_t *t) {
     if (!valid()) {
         s_ema_init=false; s_pct=0; s_full=s_charging=s_low=s_critical=false; s_chg_cnt=0;
         led_set_battery(LED_BATT_NONE);
-#if BATTERY_DEBUG
-        printf("[batt] vbat=%lumV -> no valid reading (check sense line / ADC_AVDD)\n",
-               (unsigned long)s_mv);
-#endif
         return true;
     }
 
@@ -170,11 +160,6 @@ static bool poll(repeating_timer_t *t) {
                  :               LED_BATT_NONE;
     led_set_battery(b);
 
-#if BATTERY_DEBUG
-    printf("[batt] vbat=%lumV ema=%lumV pct=%d slope=%+dmV/%ds %s\n",
-           (unsigned long)s_mv,(unsigned long)s_ema,s_pct,slope,TREND_WINDOW,
-           s_full?"FULL":s_charging?"CHARGING":s_critical?"CRITICAL":s_low?"LOW":"-");
-#endif
     return true;
 }
 

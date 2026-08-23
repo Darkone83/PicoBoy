@@ -16,6 +16,7 @@
 
 extern "C" {
 #include "arena.h"
+#include "adaptive_frameskip.h"
 #include "pins.h"
 #include "st7789.h"
 #include "buttons.h"
@@ -101,13 +102,11 @@ void Frens::getextensionfromfilename(const char *filename, char *ext, size_t ext
 // ---------------------------------------------------------------------------
 #define NES_FRAME_US 16639                            // ~60.0988 Hz
 
-// Dual-core display, the PROVEN GB model: a 16-bit double-buffer + a single
-// st7789_blit_scaled per frame + FIFO handoff. The full 256x240 frame won't
-// double-buffer in RAM, so core0 downscales it 2:1 into a 128x120 framebuffer
-// (exact half res, perfect 16:15 aspect) -- two of those are only 60K, fitting
-// the 128K arena alongside the ~64K NES core. core1 scales that up to the panel.
-// Because the cores touch different buffers (ping-pong), every blit is one whole
-// coherent frame -> no inter-core tearing, only the single GB-style scan seam.
+// Legacy dual-core fallback presentation: core0 downsamples 256x240 to a
+// 128x120 RGB565 framebuffer and Core1 scales it back to the panel. Two fallback
+// framebuffers consume 61,440 bytes of the shared work arena. The shipping
+// full-resolution scanline path below avoids that large framebuffer reservation.
+// The fallback remains only as a bring-up/A-B reference.
 #define NES_FB_W 128                                  // half of 256 (exact 2:1 down)
 #define NES_FB_H 120                                  // half of 240 (exact 2:1 down)
 #define NES_DST_W 256                                 // exact 2x of fb -> clean 2x2 blocks
@@ -117,16 +116,20 @@ void Frens::getextensionfromfilename(const char *filename, char *ext, size_t ext
 #define NES_DST_X ((LCD_W - NES_DST_W) / 2)           // centered -> 32 at 256w
 #define NES_DST_Y ((240   - NES_DST_H) / 2)           // centered -> 0  at 240h
 
-// Full-res scanline streaming. 1 (shipping default) = native 256x232: each
-// rendered line is DMA'd straight to the panel, no framebuffer, core1 freed --
-// native resolution with ~60K arena back. 0 = the older downscale + core1 blit
-// path, kept for A/B bring-up. Flip + rebuild to compare on hardware.
+// Full-res scanline streaming. 1 (shipping default) = native 256x232: Core0
+// packs native rows into the small arena-backed ring and Core1 streams them to
+// the panel, avoiding the ~60 KiB fallback framebuffers above. 0 retains the
+// older downscale + Core1 blit path only for A/B bring-up.
 #define NES_STREAM_FULLRES 1
 #define NES_STREAM_FIRST 4                             // first visible NES scanline (HSync gate)
 #define NES_STREAM_W     NES_DISP_WIDTH                // 256
 #define NES_STREAM_H     232                           // lines 4..235 inclusive
 #define NES_STREAM_X     ((LCD_W - NES_STREAM_W) / 2)  // 32, centered
 #define NES_STREAM_Y     NES_STREAM_FIRST              // 4 -> 4px overscan bars, matches downscale
+
+// Scaled keeps all 232 rows 1:1 and applies only horizontal ~8:7 aspect
+// correction in the LCD presentation layer. The selection persists in settings.
+#define NES_ASPECT_X     13                            // 293px centered: 13 left / 14 right
 
 static volatile bool g_core1_busy = false;            // PadState polls this (stays false in streaming)
 static WORD s_workline[NES_DISP_WIDTH];               // core renders the 256-wide line here (both modes)
@@ -155,6 +158,10 @@ static volatile bool s_core1_idle = true;              // core1 has exited its l
 static bool s_new_frame   = true;                      // core0: next line begins a frame
 static bool s_stream_this = false;                     // core0: streaming (not dropping) this frame
 
+static adaptive_frameskip_t s_auto_fs;
+static bool s_auto_display_observed = false;
+static bool s_auto_display_blocked  = false;
+
 // Interlace: stream even rows one frame, odd the next -> half the panel DMA, full
 // 256-wide sharpness, at the cost of slight combing on fast vertical motion. The
 // untouched field keeps last frame's rows in panel GRAM. Set 0 for progressive.
@@ -164,13 +171,6 @@ static volatile int s_field     = 0;                   // toggles 0/1 each strea
 static volatile int s_field_cur = 0;                   // field locked for the in-flight frame
 #endif
 
-// --- timing probe: prints over USB serial every 120 frames. Set 0 to disable. -
-#define NES_PROFILE 1
-#if NES_PROFILE
-#include <stdio.h>
-static volatile uint32_t pf_t0=0, pf_dt=0, pf_wait=0, pf_frames=0, pf_drops=0;
-static volatile uint32_t pf_ssum=0, pf_scnt=0;         // core1 stream-time sum / count
-#endif
 #endif
 
 // Battery SRAM (.srm) save path. Set by the loader before nes_run(); "" disables.
@@ -244,28 +244,23 @@ static void __not_in_flash_func(core1_stream)(void)
     // contiguous, so each is its own 1-row DMA.
     bool active = false;
     int  k = 0, field = 0;
-#if NES_PROFILE
-    uint32_t st0 = 0;
-#endif
     while (s_core1_run) {
         if (s_rd != s_wr) {
             if (!active) {
                 active = true; k = 0; field = s_field_cur;
-#if NES_PROFILE
-                st0 = time_us_32();
-#endif
             }
             int yrow = NES_STREAM_Y + field + 2 * k;
-            st7789_stream_row_at(NES_STREAM_X, yrow, nes_ring_row(s_rd), NES_STREAM_W);
+            const uint8_t *row = nes_ring_row(s_rd);
+            if (g_settings.nes_scaled)
+                st7789_stream_row_8_7_at(NES_ASPECT_X, yrow, row, NES_STREAM_W);
+            else
+                st7789_stream_row_at(NES_STREAM_X, yrow, row, NES_STREAM_W);
             k++;
             __sync_synchronize();
             s_rd++;
         } else if (s_frame_done) {
             if (active) {
                 active = false;
-#if NES_PROFILE
-                pf_ssum += time_us_32() - st0; pf_scnt++;
-#endif
             }
             s_frame_done = false;
         } else {
@@ -275,28 +270,25 @@ static void __not_in_flash_func(core1_stream)(void)
     s_core1_idle = true;
 #else
     bool win = false;
-#if NES_PROFILE
-    uint32_t st0 = 0;
-#endif
     while (s_core1_run) {
         if (s_rd != s_wr) {                            // a line is waiting
             if (!win) {
-                st7789_stream_begin(NES_STREAM_X, NES_STREAM_Y, NES_STREAM_W, NES_STREAM_H);
+                if (g_settings.nes_scaled)
+                    st7789_stream_begin(NES_ASPECT_X, NES_STREAM_Y, 293, NES_STREAM_H);
+                else
+                    st7789_stream_begin(NES_STREAM_X, NES_STREAM_Y, NES_STREAM_W, NES_STREAM_H);
                 win = true;
-#if NES_PROFILE
-                st0 = time_us_32();
-#endif
             }
-            const uint8_t *row = nes_ring_row(s_rd);  // already 565 panel bytes (core0 converted)
-            st7789_stream_row(row, NES_STREAM_W);          // waits prev DMA, kicks this one
+            const uint8_t *row = nes_ring_row(s_rd);  // native 256-wide packed RGB565
+            if (g_settings.nes_scaled)
+                st7789_stream_row_8_7(row, NES_STREAM_W);
+            else
+                st7789_stream_row(row, NES_STREAM_W);
             __sync_synchronize();
             s_rd++;                                        // release slot (DMA finishes long before reuse)
         } else if (s_frame_done) {                     // drained + frame done -> close the window
             if (win) {
                 st7789_stream_end(); win = false;
-#if NES_PROFILE
-                pf_ssum += time_us_32() - st0; pf_scnt++;
-#endif
             }
             s_frame_done = false;                      // ack to core0
         } else {
@@ -352,8 +344,14 @@ void __not_in_flash_func(InfoNES_PreDrawLine)(int line)
     (void)line;
 #if NES_STREAM_FULLRES
     if (s_new_frame) {                                   // first visible line of the frame
-        s_new_frame   = false;
-        s_stream_this = (!s_frame_done && s_rd == s_wr); // stream only if core1 finished the last frame
+        s_new_frame = false;
+        bool display_ready = (!s_frame_done && s_rd == s_wr);
+        s_stream_this = display_ready;
+
+        if (g_settings.frameskip < 0) {
+            s_auto_display_observed = true;
+            s_auto_display_blocked = !display_ready;
+        }
 #if NES_INTERLACE
         s_field_cur   = s_field;                         // lock this frame's field for core0 + core1
 #endif
@@ -378,13 +376,7 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
         && (((line - NES_STREAM_FIRST) & 1) == s_field_cur)   // only this frame's field
 #endif
     ) {
-#if NES_PROFILE
-        uint32_t w0 = time_us_32();
-        while ((uint32_t)(s_wr - s_rd) >= NES_RING) tight_loop_contents();   // ring full -> wait for core1
-        pf_wait += time_us_32() - w0;
-#else
         while ((uint32_t)(s_wr - s_rd) >= NES_RING) tight_loop_contents();
-#endif
         uint8_t *db = nes_ring_row(s_wr);           // convert 555->565 into the next slot
         for (int x = 0; x < NES_STREAM_W; x++) {
             WORD v = (WORD)(src[x] & 0x7FFF);
@@ -426,53 +418,56 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
 // so core0 never stalls. Audio is the master clock (snd_nes_flush below paces us).
 int InfoNES_LoadFrame(void)
 {
-    // Drive InfoNES's native frame-skip from the setting. Fixed N (0..5) makes the
-    // core skip the whole PPU pixel pipeline (PreDraw/Draw/PostDraw) on N of every
-    // N+1 frames -- real CPU savings, not just a dropped blit -- while sprite-0 hit,
-    // timing, and audio keep running. Auto (-1) renders every frame and relies on
-    // the adaptive core1-busy drop below. FrameCnt==0 == this frame was rendered.
-    FrameSkip = (g_settings.frameskip < 0) ? 0 : (WORD)g_settings.frameskip;
+    const bool rendered_frame = (FrameCnt == 0);
 
 #if NES_STREAM_FULLRES
-    if (s_stream_this) s_frame_done = true;     // tell core1: frame complete, close after it drains
-    s_new_frame = true;                         // next frame re-decides whether to stream
+    // Native FrameSkip bypasses the pixel pipeline. Do not reuse the previous
+    // rendered frame's streaming state on one of those skipped frames.
+    if (rendered_frame && s_stream_this) {
+        s_frame_done = true;
 #if NES_INTERLACE
-    if (s_stream_this) s_field ^= 1;            // alternate field on each rendered frame
+        s_field ^= 1;                             // advance only after a real streamed frame
 #endif
-#if NES_PROFILE
-    {
-        uint32_t now = time_us_32();
-        if (pf_t0) pf_dt += now - pf_t0;
-        pf_t0 = now;
-        if (!s_stream_this) pf_drops++;
-        if (++pf_frames >= 120) {
-            printf("NES frame=%luus  core0_wait=%luus  core1_stream=%luus  drops=%lu/120\n",
-                   (unsigned long)(pf_dt/120), (unsigned long)(pf_wait/120),
-                   (unsigned long)(pf_scnt ? pf_ssum/pf_scnt : 0), (unsigned long)pf_drops);
-            pf_dt=pf_wait=pf_frames=pf_drops=pf_ssum=pf_scnt=0;
-        }
     }
-#endif
+    s_stream_this = false;
+    s_new_frame = true;
 #else
-    // Video: hand a freshly rendered frame to core1 only if it's idle, else drop.
-    // Skipped frames (FrameCnt != 0) produced no new image, so never push one.
-    if (FrameCnt == 0 && !g_core1_busy) {
+    if (rendered_frame && !g_core1_busy) {
         g_core1_busy = true;
         uint32_t show = (uint32_t)g_draw;
-        g_draw ^= 1;                                // emulate next frame into the other buffer
-        multicore_fifo_push_blocking(show);         // core1 blits fb[show] while core0 draws the other
+        g_draw ^= 1;
+        multicore_fifo_push_blocking(show);
     }
 #endif
 
-    // Audio + pacing run EVERY frame -- audio is the master clock.
+    uint32_t dma_wait = UINT32_MAX;
     if (s_audio_paced) {
-        snd_nes_flush();                            // frame-aligned audio flush; blocking DMA paces us
-        return 0;
+        snd_nes_flush();
+        dma_wait = snd_dma_wait_us();
+    } else {
+        sleep_until(s_next);
+        s_next = delayed_by_us(s_next, NES_FRAME_US);
+        if (to_us_since_boot(s_next) < to_us_since_boot(get_absolute_time()))
+            s_next = make_timeout_time_us(NES_FRAME_US);
     }
-    sleep_until(s_next);                            // fallback timer pace if audio isn't running
-    s_next = delayed_by_us(s_next, NES_FRAME_US);
-    if (to_us_since_boot(s_next) < to_us_since_boot(get_absolute_time()))
-        s_next = make_timeout_time_us(NES_FRAME_US);
+
+    if (g_settings.frameskip < 0) {
+        bool display_blocked =
+            s_auto_display_observed && s_auto_display_blocked;
+
+        adaptive_frameskip_feedback(
+            &s_auto_fs,
+            adaptive_frameskip_signal(display_blocked, dma_wait));
+
+        // InfoNES already has the best possible skip point: FrameSkip bypasses
+        // PreDraw/Draw/PostDraw while CPU/timing/audio continue.
+        FrameSkip = (WORD)adaptive_frameskip_level(&s_auto_fs);
+    } else {
+        FrameSkip = (WORD)g_settings.frameskip;
+    }
+
+    s_auto_display_observed = false;
+    s_auto_display_blocked = false;
     return 0;
 }
 
@@ -643,9 +638,14 @@ static bool nes_state_exists(void) {
 static int nes_overlay(void)
 {
     static const char *const labels[] = {
-        "Resume", "Brightness", "Volume", "Frame Skip", "Save State", "Load State", "Quit"
+        "Resume", "Brightness", "Volume", "Frame Skip", "NES Display",
+        "Save State", "Load State", "Quit"
     };
-    const int N = 7;
+    const int N = 8;
+    const int display_idx = 4;
+    const int save_idx = 5;
+    const int load_idx = 6;
+    const int quit_idx = 7;
     const bool have_path = (g_nes_state_path[0] != '\0');   // Save State enabled
     bool have_saved = nes_state_exists();                   // Load State enabled
     int  sel = 0;
@@ -659,9 +659,9 @@ static int nes_overlay(void)
             st7789_fill(g_theme->bg);
             ui_pause_header(ui_now_playing(), title_off);
             for (int i = 0; i < N; i++) {
-                int      y  = 40 + i * 20;
+                int      y  = 38 + i * 18;
                 bool     on = (i == sel);
-                bool     dimmed = (i == 4 && !have_path) || (i == 5 && !have_saved);   // greyed
+                bool     dimmed = (i == save_idx && !have_path) || (i == load_idx && !have_saved);
                 uint16_t fg = on ? g_theme->sel_fg : (dimmed ? g_theme->footer_fg : g_theme->item_fg);
                 uint16_t bg = on ? g_theme->sel_bg : g_theme->bg;
                 if (on) ui_fill_pill(8, y - 3, LCD_W - 16, 18, bg);
@@ -673,6 +673,8 @@ static int nes_overlay(void)
                 else if (i == 2) snprintf(val, sizeof val, "%u%%", g_settings.volume);
                 else if (i == 3) { if (g_settings.frameskip < 0) snprintf(val, sizeof val, "Auto");
                                    else snprintf(val, sizeof val, "%d", g_settings.frameskip); }
+                else if (i == display_idx)
+                    snprintf(val, sizeof val, "%s", g_settings.nes_scaled ? "Scaled" : "Native");
                 if (val[0]) st7789_draw_string(180, y, val, fg, bg, 1);
             }
             ui_footer("D-pad move/adjust  A select  B resume");
@@ -713,12 +715,21 @@ static int nes_overlay(void)
                 if (f < -1) f = 5; if (f > 5) f = -1;
                 g_settings.frameskip = (int8_t)f;
                 dirty = true; redraw = true;
+            } else if (sel == display_idx) {
+                g_settings.nes_scaled ^= 1u;
+                dirty = true;
+                redraw = true;
             }
         }
 
         if (ev & (1u << BTN_A)) {
             if (sel == 0) { ret = 0; break; }               // Resume
-            else if (sel == 4 && have_path) {               // Save State
+            else if (sel == display_idx) {
+                g_settings.nes_scaled ^= 1u;
+                dirty = true;
+                redraw = true;
+            }
+            else if (sel == save_idx && have_path) {         // Save State
                 led_set_state(LED_SD_BUSY);
                 bool sok = save_nes_state();
                 led_set_state(LED_RUNNING);
@@ -727,7 +738,7 @@ static int nes_overlay(void)
                 st7789_draw_string(16, 188, sok ? "State saved" : "Save failed",
                                    sok ? g_theme->ok : g_theme->err, g_theme->bg, 1);
             }
-            else if (sel == 5 && have_saved) {              // Load State -> resume into it
+            else if (sel == load_idx && have_saved) {       // Load State -> resume into it
                 led_set_state(LED_SD_BUSY);
                 bool lok = load_nes_state();
                 led_set_state(LED_RUNNING);
@@ -735,7 +746,7 @@ static int nes_overlay(void)
                 st7789_fill_rect(16, 188, LCD_W - 32, 10, g_theme->bg);
                 st7789_draw_string(16, 188, "No state / load failed", g_theme->err, g_theme->bg, 1);
             }
-            else if (sel == 6) { ret = 1; break; }          // Quit to menu
+            else if (sel == quit_idx) { ret = 1; break; }   // Quit to menu
         }
         sleep_ms(15);
     }
@@ -763,7 +774,16 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
             *pdwPad1 = 0; *pdwPad2 = 0; *pdwSystem = PAD_SYS_QUIT;
             return;
         }
-        buttons_update();                                   // refresh edges after the modal
+        adaptive_frameskip_reset(&s_auto_fs);
+        s_auto_display_observed = false;
+        s_auto_display_blocked = false;
+        FrameCnt = 0;
+        FrameSkip = (g_settings.frameskip < 0)
+                  ? 0
+                  : (WORD)g_settings.frameskip;
+        s_new_frame = true;
+        s_stream_this = false;
+        buttons_update();                                     // refresh edges after the modal
     }
 
     uint16_t s = buttons_state();
@@ -818,8 +838,8 @@ extern "C" void nes_run(void)
 
     if (InfoNES_Load("") == 0) {                     // ReadRom (flash) + Reset (banks/mapper)
 #if NES_STREAM_FULLRES
-        // The native scanline ring is NES-only. Put its 4 KiB in the arena; the
-        // APU cleanup already recovered roughly this much arena space.
+        // The native scanline ring is NES-only and lives in the shared work
+        // arena only while the NES core is active.
         s_ring = (uint8_t *)Frens::f_malloc(NES_RING * NES_STREAM_W * 2u);
         if (!s_ring) {
             st7789_fill(g_theme->bg);
@@ -879,8 +899,15 @@ extern "C" void nes_run(void)
         g_core1_busy = false;
         multicore_launch_core1(core1_display);
 #else
-        s_wr = s_rd = 0; s_frame_done = false;       // core1 owns the panel; core0 just produces lines
+        s_wr = s_rd = 0; s_frame_done = false;
         s_new_frame = true; s_stream_this = false;
+        adaptive_frameskip_reset(&s_auto_fs);
+        s_auto_display_observed = false;
+        s_auto_display_blocked = false;
+        FrameCnt = 0;
+        FrameSkip = (g_settings.frameskip < 0)
+                  ? 0
+                  : (WORD)g_settings.frameskip;
         s_core1_run = true; s_core1_idle = false;
         multicore_launch_core1(core1_stream);
 #endif

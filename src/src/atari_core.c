@@ -10,6 +10,7 @@
 #include "atari_riot.h"
 #include "atari_tia.h"
 #include "arena.h"
+#include "adaptive_frameskip.h"
 #include "flash.h"
 #include "st7789.h"
 #include "pins.h"
@@ -41,8 +42,6 @@
 #define ATARI_DST_H 192
 #define ATARI_DST_X ((LCD_W - ATARI_DST_W) / 2)   // 32
 #define ATARI_DST_Y ((LCD_H - ATARI_DST_H) / 2)   // 24
-
-#define ATARI_PROFILE 1
 
 static uint32_t s_rom_size = 0;
 static uint8_t *s_fb[2];
@@ -373,17 +372,10 @@ typedef struct {
     bool prev_vsync;
     bool frame_edge_pending;
 
-    uint32_t frame_t0;
-    uint32_t frames;
-    uint32_t drops;
     uint32_t present_seq;
 
-#if ATARI_PROFILE
-    uint64_t prof_sum;
-    uint32_t prof_min;
-    uint32_t prof_max;
-    uint32_t prof_n;
-#endif
+    adaptive_frameskip_t auto_fs;
+    bool capture_this_frame;
 } atari_machine_t;
 
 static atari_machine_t m;
@@ -417,8 +409,12 @@ static bool machine_line_done(void) {
         // prevents later VBLANK tricks from shifting the whole LCD frame while
         // still letting each ROM choose its real top-of-picture scanline.
         if (m.capture_started && m.active_line < ATARI_FB_H) {
-            memcpy(&s_fb[m.draw][m.active_line * ATARI_FB_W],
-                   atari_tia_line(), ATARI_FB_W);
+            // Never skip TIA raster execution: collisions/timing depend on it.
+            // Auto suppresses only the host framebuffer capture/copy.
+            if (m.capture_this_frame) {
+                memcpy(&s_fb[m.draw][m.active_line * ATARI_FB_W],
+                       atari_tia_line(), ATARI_FB_W);
+            }
             m.active_line++;
         }
     }
@@ -491,29 +487,37 @@ bool atari_machine_tia_write_complete(void) {
 }
 
 static void machine_process_frame(void) {
-    uint32_t now = time_us_32();
-    uint32_t raw_us = now - m.frame_t0;
+    const bool auto_mode = (g_settings.frameskip < 0);
 
-    bool want_show = (g_settings.frameskip < 0)
-                   ? true
+    bool want_show = auto_mode
+                   ? m.capture_this_frame
                    : ((m.present_seq %
                        (uint32_t)(g_settings.frameskip + 1)) == 0);
     m.present_seq++;
 
+    bool display_blocked = false;
     if (m.active_line > 0 && want_show) {
         if (!s_core1_busy) {
             s_core1_busy = true;
             multicore_fifo_push_blocking((uint32_t)m.draw);
             m.draw ^= 1;
         } else {
-            m.drops++;
+            display_blocked = true;
         }
-    } else if (m.active_line > 0 && !want_show) {
-        m.drops++;
     }
 
-    memset(s_fb[m.draw], 0, ATARI_FB_BYTES);
-    m.frames++;
+    if (auto_mode) {
+        adaptive_frameskip_feedback(
+            &m.auto_fs,
+            adaptive_frameskip_signal(display_blocked, snd_dma_wait_us()));
+        m.capture_this_frame = adaptive_frameskip_should_render(&m.auto_fs);
+    } else {
+        // Manual 0..5 remains presentation-only, matching existing behavior.
+        m.capture_this_frame = true;
+    }
+
+    if (m.capture_this_frame)
+        memset(s_fb[m.draw], 0, ATARI_FB_BYTES);
 
     // Atari audio is continuously queued in fixed-size DMA blocks by
     // snd_atari_sample().  Do not flush a short/variable block at every VSYNC:
@@ -533,40 +537,15 @@ static void machine_process_frame(void) {
             m.quit = true;
         } else {
             snd_atari_open();
+            adaptive_frameskip_reset(&m.auto_fs);
+            m.capture_this_frame = true;
+            memset(s_fb[m.draw], 0, ATARI_FB_BYTES);
             poll_input();
-            m.frame_t0 = time_us_32();
         }
     }
 
-#if ATARI_PROFILE
-    if (m.frames > 1) {
-        m.prof_sum += raw_us;
-        if (raw_us < m.prof_min) m.prof_min = raw_us;
-        if (raw_us > m.prof_max) m.prof_max = raw_us;
-        m.prof_n++;
-    }
-
-    if (m.prof_n >= 120) {
-        printf("[2600] %s core=%luus min=%lu max=%lu drops=%lu "
-               "pc=%04x audio=avg441 sched=deferred video=full rom=sram\n",
-               atari_cart_type_name(),
-               (unsigned long)(m.prof_sum / m.prof_n),
-               (unsigned long)m.prof_min,
-               (unsigned long)m.prof_max,
-               (unsigned long)m.drops,
-               (unsigned)atari_cpu_pc());
-
-        m.prof_sum = 0;
-        m.prof_min = 0xFFFFFFFFu;
-        m.prof_max = 0;
-        m.prof_n = 0;
-        m.drops = 0;
-    }
-#endif
 
 
-    if (!m.quit)
-        m.frame_t0 = time_us_32();
 }
 
 // --------------------------------------------------------------------------
@@ -642,11 +621,8 @@ void atari_core_run(void) {
     m.draw = 0;
     m.capture_started = false;
     m.prev_vsync = atari_tia_vsync();
-    m.frame_t0 = time_us_32();
-
-#if ATARI_PROFILE
-    m.prof_min = 0xFFFFFFFFu;
-#endif
+    adaptive_frameskip_reset(&m.auto_fs);
+    m.capture_this_frame = true;
 
     while (!m.quit && !atari_cpu_halted()) {
         if (!atari_cpu_step_instruction())

@@ -8,6 +8,7 @@
 
 #include "sms_core.h"
 #include "arena.h"
+#include "adaptive_frameskip.h"
 #include "flash.h"
 #include "st7789.h"
 #include "pins.h"
@@ -63,48 +64,22 @@ void sms_core_set_state_path(const char *path) { set_path(s_state_path, path); }
 
 static uint8_t *s_apos = NULL;
 static uint8_t *s_aend = NULL;
-static uint32_t s_alloc_count = 0;
 
 static void sms_arena_reset(void) {
     s_apos = arena_base();
     s_aend = arena_base() + ARENA_WORK_BYTES;
-    s_alloc_count = 0;
-
-    printf("[SMS] arena base=%p work=%lu audio_tail=%lu\n",
-           (void *)s_apos,
-           (unsigned long)ARENA_WORK_BYTES,
-           (unsigned long)ARENA_AUDIO_BYTES);
 }
 
 void *frens_f_malloc(size_t size) {
-    if (!s_apos || !s_aend) {
-        printf("[SMS] alloc refused: arena not initialized\n");
+    if (!s_apos || !s_aend)
         return NULL;
-    }
 
-    size_t requested = size;
     size = (size + 3u) & ~3u;
-    size_t free_before = (size_t)(s_aend - s_apos);
-
-    if (free_before < size) {
-        printf("[SMS] OOM alloc#%lu request=%lu aligned=%lu free=%lu\n",
-               (unsigned long)(s_alloc_count + 1u),
-               (unsigned long)requested,
-               (unsigned long)size,
-               (unsigned long)free_before);
+    if ((size_t)(s_aend - s_apos) < size)
         return NULL;
-    }
 
     void *p = s_apos;
     s_apos += size;
-    s_alloc_count++;
-
-    printf("[SMS] alloc#%lu req=%lu used=%lu free=%lu ptr=%p\n",
-           (unsigned long)s_alloc_count,
-           (unsigned long)requested,
-           (unsigned long)(s_apos - arena_base()),
-           (unsigned long)(s_aend - s_apos),
-           p);
     return p;
 }
 
@@ -165,40 +140,31 @@ void sms_palette_syncGG(int index) {
 
 // Game Gear display modes.
 //
-// NATIVE:
-//   160x144 -> 160x144, centered at 80,48. Every source pixel is one LCD pixel.
+// Native:
+//   160x144 -> 160x144, centered at 80,48.
 //
-// 2X ZOOM:
-//   center-crop 160x120 from the 160x144 GG viewport, then duplicate every
-//   source pixel to an exact 2x2 LCD block -> 320x240. This fills the panel
-//   without fractional scaling or blur. The tradeoff is 12 source lines
-//   cropped from both the top and bottom.
-enum {
-    GG_DISPLAY_NATIVE = 0,
-    GG_DISPLAY_ZOOM_2X = 1,
-};
-
+// Scaled:
+//   160x144 -> 240x216, centered at 40,12.
+//   Every two source pixels/rows become three using A, average(A,B), B.
+//   The selection is persistent in g_settings.gg_scaled.
 #define GG_NATIVE_DST_W    160
 #define GG_NATIVE_DST_H    144
 #define GG_NATIVE_DST_X    80
 #define GG_NATIVE_DST_Y    48
 
-#define GG_ZOOM_SRC_H      120
-#define GG_ZOOM_CROP_Y     ((GG_NATIVE_H - GG_ZOOM_SRC_H) / 2)  // 12
-#define GG_ZOOM_DST_W      320
-#define GG_ZOOM_DST_H      240
-#define GG_ZOOM_DST_X      0
-#define GG_ZOOM_DST_Y      0
+#define GG_SCALED_DST_W    240
+#define GG_SCALED_DST_H    216
+#define GG_SCALED_DST_X    40
+#define GG_SCALED_DST_Y    12
+#define GG_SCALED_ROW_BYTES (GG_SCALED_DST_W * 2u)
 
-// Session-local by design: some games tolerate the 2x vertical crop better
-// than others. Native is the correctness-first default on each game launch.
-static volatile uint8_t s_gg_display_mode = GG_DISPLAY_NATIVE;
-
-#define SMS_RING           4u
-#define SMS_ROW_MAX_W      320u
+#define SMS_RING           8u
+#define SMS_ROW_MAX_W      256u
 #define SMS_ROW_BYTES      (SMS_ROW_MAX_W * 2u)
 
 static uint8_t *s_ring = NULL; // SMS_RING * SMS_ROW_BYTES, allocated from arena
+static uint8_t *s_gg_scaled_prev = NULL; // 240px packed RGB565 scratch
+static uint8_t *s_gg_scaled_cur  = NULL; // 240px packed RGB565 scratch
 static volatile uint32_t s_wr = 0;
 static volatile uint32_t s_rd = 0;
 static volatile bool s_frame_done = false;
@@ -206,7 +172,6 @@ static volatile bool s_core1_run = false;
 static volatile bool s_core1_idle = true;
 static volatile bool s_core1_started = false;
 static bool s_stream_this = false;
-static bool s_boot_line_trace = false;
 
 static inline uint8_t *ring_row(uint32_t index) {
     return s_ring + (index % SMS_RING) * SMS_ROW_BYTES;
@@ -214,36 +179,47 @@ static inline uint8_t *ring_row(uint32_t index) {
 
 static void __not_in_flash_func(sms_core1_stream)(void) {
     bool win = false;
-    int src_row = 0;
     int width = SMS_NATIVE_W;
     int dx = SMS_DST_X;
     int dy = SMS_DST_Y;
     int dh = SMS_NATIVE_H;
-    bool frame_gg_zoom = false;
+    bool frame_gg_scaled = false;
+
+    /*
+     * s_send is the next ring slot Core1 intends to submit.
+     * s_rd is the first slot Core0 may safely reuse.
+     *
+     * st7789_stream_row() waits for the PREVIOUS DMA and then starts the new
+     * one. Therefore the just-submitted row is still owned by DMA when the
+     * function returns. The old SMS/GG path advanced s_rd immediately and could
+     * let Core0 overwrite that slot while SPI was still reading it.
+     *
+     * Keep one source row explicitly in-flight. A slot is released only after
+     * the next DMA launch proves the previous row completed, or stream_end()
+     * drains the final DMA at the end of the frame.
+     */
+    uint32_t s_send = s_rd;
+    bool have_inflight = false;
 
     s_core1_idle = false;
     __sync_synchronize();
     s_core1_started = true;
 
     while (s_core1_run) {
-        if (s_rd != s_wr) {
+        if (s_send != s_wr) {
             if (!win) {
-                // The overlay may change GG view mode while Core1 is parked.
-                // Snapshot the mode when a new frame begins so geometry stays
-                // constant for the whole RAMWR transaction.
-                frame_gg_zoom = s_is_gg &&
-                                (s_gg_display_mode == GG_DISPLAY_ZOOM_2X);
+                frame_gg_scaled = s_is_gg && (g_settings.gg_scaled != 0);
 
                 if (!s_is_gg) {
                     width = SMS_NATIVE_W;
                     dx = SMS_DST_X;
                     dy = SMS_DST_Y;
                     dh = SMS_NATIVE_H;
-                } else if (frame_gg_zoom) {
-                    width = GG_ZOOM_DST_W;
-                    dx = GG_ZOOM_DST_X;
-                    dy = GG_ZOOM_DST_Y;
-                    dh = GG_ZOOM_DST_H;
+                } else if (frame_gg_scaled) {
+                    width = GG_SCALED_DST_W;
+                    dx = GG_SCALED_DST_X;
+                    dy = GG_SCALED_DST_Y;
+                    dh = GG_SCALED_DST_H;
                 } else {
                     width = GG_NATIVE_DST_W;
                     dx = GG_NATIVE_DST_X;
@@ -253,36 +229,97 @@ static void __not_in_flash_func(sms_core1_stream)(void) {
 
                 st7789_stream_begin(dx, dy, width, dh);
                 win = true;
-                src_row = 0;
+                have_inflight = false;
             }
 
-            const uint8_t *row = ring_row(s_rd);
+            const uint8_t *row = ring_row(s_send);
 
-            if (frame_gg_zoom) {
-                // Exact integer 2x vertical expansion: one emulated source row
-                // becomes two identical LCD rows.
-                st7789_stream_row(row, width);
-                st7789_stream_row(row, width);
-            } else {
-                st7789_stream_row(row, width);
+            st7789_stream_row(row, width);
+
+            // At this point the PREVIOUS source row is guaranteed complete.
+            // Keep the current source row reserved until the next launch.
+            if (have_inflight) {
+                __sync_synchronize();
+                s_rd = s_send;
             }
 
-            src_row++;
-            __sync_synchronize();
-            s_rd++;
+            s_send++;
+            have_inflight = true;
+
         } else if (s_frame_done) {
             if (win) {
+                // Drains the final DMA, so the last submitted source row is now
+                // safe for Core0 to reuse as well.
                 st7789_stream_end();
                 win = false;
             }
+
+            __sync_synchronize();
+            s_rd = s_send;
+            have_inflight = false;
             s_frame_done = false; // acknowledge complete frame to core0
+
         } else {
             tight_loop_contents();
         }
     }
 
-    if (win) st7789_stream_end();
+    if (win) {
+        st7789_stream_end();
+        s_rd = s_send;
+    }
     s_core1_idle = true;
+}
+
+static inline uint16_t gg_avg565(uint16_t a, uint16_t b) {
+    // Exact channel-wise rounded average, packed:
+    //   floor((A+B)/2) per RGB565 field, plus one when that field's LSB differs.
+    // This is pixel-identical to the previous extract/add/repack implementation.
+    uint16_t x = (uint16_t)(a ^ b);
+    return (uint16_t)((a & b) +
+                      ((x & 0xF7DEu) >> 1) +
+                      (x & 0x0821u));
+}
+
+static inline void gg_put565(uint8_t *dst, int x, uint16_t c) {
+    dst[x * 2]     = (uint8_t)(c >> 8);
+    dst[x * 2 + 1] = (uint8_t)c;
+}
+
+static void __not_in_flash_func(gg_build_scaled_row)(uint8_t *dst,
+                                                      const uint8_t *src) {
+    // 160 -> 240. Each non-overlapping pair becomes:
+    //   A, average(A,B), B
+    // so the scale has a stable 3-pixels-for-2-source-pixels cadence without
+    // whole-pixel interpolation across every output sample.
+    for (int sx = 0, ox = 0; sx < GG_NATIVE_W; sx += 2, ox += 3) {
+        uint16_t a = s_pal565[src[sx] & 0x1Fu];
+        uint16_t b = s_pal565[src[sx + 1] & 0x1Fu];
+        gg_put565(dst, ox + 0, a);
+        gg_put565(dst, ox + 1, gg_avg565(a, b));
+        gg_put565(dst, ox + 2, b);
+    }
+}
+
+static void __not_in_flash_func(gg_mix_scaled_rows)(uint8_t *dst,
+                                                     const uint8_t *a,
+                                                     const uint8_t *b) {
+    for (int x = 0; x < GG_SCALED_DST_W; x++) {
+        uint16_t ca = (uint16_t)((a[x * 2] << 8) | a[x * 2 + 1]);
+        uint16_t cb = (uint16_t)((b[x * 2] << 8) | b[x * 2 + 1]);
+        gg_put565(dst, x, gg_avg565(ca, cb));
+    }
+}
+
+static void __not_in_flash_func(queue_packed_row)(const uint8_t *src,
+                                                   unsigned bytes) {
+    while ((uint32_t)(s_wr - s_rd) >= SMS_RING)
+        tight_loop_contents();
+
+    uint8_t *dst = ring_row(s_wr);
+    memcpy(dst, src, bytes);
+    __sync_synchronize();
+    s_wr++;
 }
 
 // Called by upstream render.c after composing one palette-indexed VDP line.
@@ -291,13 +328,6 @@ static void __not_in_flash_func(sms_core1_stream)(void) {
 void __not_in_flash_func(sms_render_line)(int line, const uint8_t *buffer) {
     if (!s_stream_this || !buffer || !s_ring) return;
 
-    if (s_boot_line_trace && line < 8) {
-        printf("[SMS] hook line=%d enter wr=%lu rd=%lu depth=%lu\n",
-               line,
-               (unsigned long)s_wr,
-               (unsigned long)s_rd,
-               (unsigned long)(s_wr - s_rd));
-    }
 
     if (!s_is_gg) {
         if (line < 0 || line >= SMS_NATIVE_H) return;
@@ -312,55 +342,53 @@ void __not_in_flash_func(sms_render_line)(int line, const uint8_t *buffer) {
             dst[x * 2 + 1] = (uint8_t)c;
         }
     } else {
-        const bool zoom = (s_gg_display_mode == GG_DISPLAY_ZOOM_2X);
+        const uint8_t *src = buffer + GG_SRC_X;
 
-        if (!zoom) {
-            if (line < GG_SRC_Y || line >= GG_SRC_Y + GG_NATIVE_H) return;
-        } else {
-            const int first = GG_SRC_Y + GG_ZOOM_CROP_Y;
-            const int last  = first + GG_ZOOM_SRC_H;
-            if (line < first || line >= last) return;
+        if (line < GG_SRC_Y || line >= GG_SRC_Y + GG_NATIVE_H) return;
+
+        if (g_settings.gg_scaled) {
+            if (!s_gg_scaled_prev || !s_gg_scaled_cur) return;
+
+            int sy = line - GG_SRC_Y;
+
+            if ((sy & 1) == 0) {
+                // First row of a pair: output A and retain it.
+                gg_build_scaled_row(s_gg_scaled_prev, src);
+                queue_packed_row(s_gg_scaled_prev, GG_SCALED_ROW_BYTES);
+            } else {
+                // Second row B completes the 3-for-2 cadence:
+                // A was already queued, now queue average(A,B), then B.
+                gg_build_scaled_row(s_gg_scaled_cur, src);
+
+                while ((uint32_t)(s_wr - s_rd) >= SMS_RING)
+                    tight_loop_contents();
+                uint8_t *mid = ring_row(s_wr);
+                gg_mix_scaled_rows(mid, s_gg_scaled_prev, s_gg_scaled_cur);
+                __sync_synchronize();
+                s_wr++;
+
+                queue_packed_row(s_gg_scaled_cur, GG_SCALED_ROW_BYTES);
+            }
+            return;
         }
 
         while ((uint32_t)(s_wr - s_rd) >= SMS_RING)
             tight_loop_contents();
 
         uint8_t *dst = ring_row(s_wr);
-        const uint8_t *src = buffer + GG_SRC_X;
-
-        if (!zoom) {
-            // Pixel-perfect native Game Gear output.
-            for (int x = 0; x < GG_NATIVE_W; x++) {
-                uint16_t c = s_pal565[src[x] & 0x1Fu];
-                dst[x * 2]     = (uint8_t)(c >> 8);
-                dst[x * 2 + 1] = (uint8_t)c;
-            }
-        } else {
-            // Exact integer 2x horizontal expansion. Each source pixel becomes
-            // two adjacent RGB565 LCD pixels; Core1 duplicates the row vertically.
-            for (int x = 0; x < GG_NATIVE_W; x++) {
-                uint16_t c = s_pal565[src[x] & 0x1Fu];
-                uint8_t hi = (uint8_t)(c >> 8);
-                uint8_t lo = (uint8_t)c;
-                int o = x * 4;
-                dst[o + 0] = hi;
-                dst[o + 1] = lo;
-                dst[o + 2] = hi;
-                dst[o + 3] = lo;
-            }
+        for (int x = 0; x < GG_NATIVE_W; x++) {
+            uint16_t c = s_pal565[src[x] & 0x1Fu];
+            dst[x * 2]     = (uint8_t)(c >> 8);
+            dst[x * 2 + 1] = (uint8_t)c;
         }
-    }
 
+        __sync_synchronize();
+        s_wr++;
+        return;
+    }
     __sync_synchronize();
     s_wr++;
 
-    if (s_boot_line_trace && line < 8) {
-        printf("[SMS] hook line=%d queued wr=%lu rd=%lu depth=%lu\n",
-               line,
-               (unsigned long)s_wr,
-               (unsigned long)s_rd,
-               (unsigned long)(s_wr - s_rd));
-    }
 }
 
 static void display_drain(void) {
@@ -521,8 +549,7 @@ static int sms_overlay(void) {
                     else snprintf(val, sizeof val, "%d", g_settings.frameskip);
                 } else if (i == display_idx) {
                     snprintf(val, sizeof val, "%s",
-                             s_gg_display_mode == GG_DISPLAY_ZOOM_2X
-                                 ? "2x Zoom" : "Native");
+                             g_settings.gg_scaled ? "Scaled" : "Native");
                 }
 
                 if (val[0]) st7789_draw_string(180, y, val, fg, bg, 1);
@@ -575,10 +602,8 @@ static int sms_overlay(void) {
                 redraw = true;
 
             } else if (sel == display_idx) {
-                s_gg_display_mode =
-                    (s_gg_display_mode == GG_DISPLAY_NATIVE)
-                        ? GG_DISPLAY_ZOOM_2X
-                        : GG_DISPLAY_NATIVE;
+                g_settings.gg_scaled ^= 1u;
+                dirty = true;
                 __sync_synchronize();
                 redraw = true;
             }
@@ -590,10 +615,8 @@ static int sms_overlay(void) {
                 break;
 
             } else if (sel == display_idx) {
-                s_gg_display_mode =
-                    (s_gg_display_mode == GG_DISPLAY_NATIVE)
-                        ? GG_DISPLAY_ZOOM_2X
-                        : GG_DISPLAY_NATIVE;
+                g_settings.gg_scaled ^= 1u;
+                dirty = true;
                 __sync_synchronize();
                 redraw = true;
 
@@ -655,21 +678,13 @@ static void set_input(uint16_t held) {
 }
 
 static bool bind_staged_rom(void) {
-    if (s_rom_size < 0x4000u) {
-        printf("[SMS] ROM rejected: raw size %lu < 16 KiB\n",
-               (unsigned long)s_rom_size);
+    if (s_rom_size < 0x4000u)
         return false;
-    }
 
     const uint32_t flash_off = ROM_FLASH_OFFSET;
     uint8_t *rom = (uint8_t *)(uintptr_t)flash_ptr(flash_off);
     uint32_t size = s_rom_size;
 
-    printf("[SMS] bind type=%s raw=%lu flash_off=0x%06lx xip=%p\n",
-           s_is_gg ? "GG" : "SMS",
-           (unsigned long)s_rom_size,
-           (unsigned long)flash_off,
-           (void *)rom);
 
     // Sega dumps may carry a 512-byte copier header.
     if ((size / 512u) & 1u) {
@@ -679,17 +694,9 @@ static bool bind_staged_rom(void) {
     }
 
     uint32_t pages = size / 0x4000u;
-    if (pages == 0 || pages > 255u) {
-        printf("[SMS] ROM rejected: effective=%lu pages=%lu\n",
-               (unsigned long)size, (unsigned long)pages);
+    if (pages == 0 || pages > 255u)
         return false;
-    }
 
-    printf("[SMS] ROM effective=%lu pages=%lu header=%s end_off=0x%06lx\n",
-           (unsigned long)size,
-           (unsigned long)pages,
-           (rom != flash_ptr(flash_off)) ? "512" : "none",
-           (unsigned long)(flash_off + s_rom_size));
 
     // Set type BEFORE BMP_WIDTH/BMP_HEIGHT are evaluated. Upstream loadrom.c
     // currently does this in the opposite order, which can leave the first GG
@@ -724,12 +731,6 @@ static void show_core_error(const char *msg) {
 }
 
 void sms_core_run(void) {
-    // Native is the correctness-first default for every GG launch. Users can
-    // opt into exact 2x center-crop zoom from the in-game overlay.
-    s_gg_display_mode = GG_DISPLAY_NATIVE;
-
-    printf("[SMSDBG3] sms_core_run HEADLESS-PROBE build\n");
-
     if (!s_rom_size) {
         show_core_error("No staged ROM size");
         led_set_state(LED_IDLE);
@@ -766,93 +767,42 @@ void sms_core_run(void) {
     st7789_fill(COL_BLACK);
 
     /*
-     * Match upstream pico-smsplus startup exactly:
+     * Match upstream pico-smsplus startup:
+     *   load/bind ROM -> system_init() -> system_reset() -> run frames.
      *
-     *   load_rom()
-     *   system_init()
-     *   system_reset()
-     *   run frames
-     *
-     * system_init() performs the dynamic allocations and initializes each
-     * subsystem. system_reset() then establishes the final CPU/VDP/SMS/render
-     * power-on state and calls our system_load_sram() hook.
-     *
-     * Previously PicoBoy called system_load_sram() directly and skipped the
-     * post-init system_reset().
+     * system_reset() establishes the CPU/VDP/SMS/render power-on state and
+     * calls the PicoBoy battery-SRAM load hook.
      */
-    printf("[SMS] system_init begin used=%lu free=%lu\n",
-           (unsigned long)(s_apos - arena_base()),
-           (unsigned long)(s_aend - s_apos));
     system_init(SMS_AUD_RATE);
-    printf("[SMS] system_init done used=%lu free=%lu snd=%d buf=%d\n",
-           (unsigned long)(s_apos - arena_base()),
-           (unsigned long)(s_aend - s_apos),
-           snd.enabled, snd.bufsize);
-
-    printf("[SMS] system_reset begin\n");
     system_reset();
-    printf("[SMS] system_reset done pc=%04x used=%lu free=%lu\n",
-           (unsigned)(z80_get_pc() & 0xFFFFu),
-           (unsigned long)(s_apos - arena_base()),
-           (unsigned long)(s_aend - s_apos));
 
-    {
-        PAIR probe;
-        probe.d = 0x11223344u;
-        const uint8_t *raw = (const uint8_t *)&probe;
-        printf("[SMS] endian PAIR bytes=%02x %02x %02x %02x "
-               "b.l=%02x b.h=%02x w.l=%04x\n",
-               raw[0], raw[1], raw[2], raw[3],
-               probe.b.l, probe.b.h, probe.w.l);
+    // Eight converted scanlines, matching the NES full-resolution streamer,
+    // decouple core0 from SPI. GG also gets two 240-pixel scratch rows for the
+    // optional persistent Scaled mode; no full framebuffer is added.
+    s_ring = (uint8_t *)frens_f_malloc(SMS_RING * SMS_ROW_BYTES);
+    if (s_is_gg) {
+        s_gg_scaled_prev = (uint8_t *)frens_f_malloc(GG_SCALED_ROW_BYTES);
+        s_gg_scaled_cur  = (uint8_t *)frens_f_malloc(GG_SCALED_ROW_BYTES);
+    } else {
+        s_gg_scaled_prev = NULL;
+        s_gg_scaled_cur  = NULL;
     }
 
-    /*
-     * Decisive startup probe: execute one complete emulated frame with
-     * rendering disabled BEFORE launching Core 1 or opening the PicoBoy I2S
-     * output path. SMSPlus still runs VDP timing, Z80 execution and PSG
-     * generation, but sms_render_line() is never called.
-     *
-     * If "headless frame done" prints, the SMSPlus core is alive and the
-     * remaining fault is in display/Core1 integration. If it does not print,
-     * Core1/LCD cannot be the cause.
-     */
-    printf("[SMSDBG3] headless frame begin pc=%04x rom0=%02x %02x %02x %02x\n",
-           (unsigned)(z80_get_pc() & 0xFFFFu),
-           cart.rom[0], cart.rom[1], cart.rom[2], cart.rom[3]);
-
-    sms_frame(1);
-
-    printf("[SMSDBG3] headless frame done pc=%04x snd=%d wr=%lu rd=%lu\n",
-           (unsigned)(z80_get_pc() & 0xFFFFu),
-           snd.enabled,
-           (unsigned long)s_wr,
-           (unsigned long)s_rd);
-
-    // Return to a clean power-on state before the visible first frame.
-    printf("[SMSDBG3] reset after headless probe\n");
-    system_reset();
-    printf("[SMSDBG3] reset after probe done pc=%04x\n",
-           (unsigned)(z80_get_pc() & 0xFFFFu));
-
-    // Four converted scanlines is enough to decouple core0 from SPI without a
-    // framebuffer. SMS is 256x192 1:1. GG is either native 160x144 or an exact
-    // integer 2x center-crop zoom at 320x240.
-    s_ring = (uint8_t *)frens_f_malloc(SMS_RING * SMS_ROW_BYTES);
-    if (!s_ring) {
+    if (!s_ring || (s_is_gg && (!s_gg_scaled_prev || !s_gg_scaled_cur))) {
         system_shutdown();
         pb_vdp_ptr = NULL;
+        s_ring = NULL;
+        s_gg_scaled_prev = NULL;
+        s_gg_scaled_cur = NULL;
         show_core_error("Out of RAM (video ring)");
         led_set_state(LED_IDLE);
         return;
     }
     memset(s_ring, 0, SMS_RING * SMS_ROW_BYTES);
-    printf("[SMS] video ring ready used=%lu free=%lu\n",
-           (unsigned long)(s_apos - arena_base()),
-           (unsigned long)(s_aend - s_apos));
+    if (s_gg_scaled_prev) memset(s_gg_scaled_prev, 0, GG_SCALED_ROW_BYTES);
+    if (s_gg_scaled_cur)  memset(s_gg_scaled_cur,  0, GG_SCALED_ROW_BYTES);
 
-    printf("[SMS] audio open\n");
     snd_sms_open();
-    printf("[SMS] audio ready\n");
 
     s_wr = s_rd = 0;
     s_frame_done = false;
@@ -860,20 +810,20 @@ void sms_core_run(void) {
     s_core1_started = false;
     s_core1_run = true;
     s_core1_idle = false;
-    printf("[SMS] core1 launch\n");
     multicore_launch_core1(sms_core1_stream);
 
     absolute_time_t core1_deadline = make_timeout_time_ms(100);
     while (!s_core1_started && !time_reached(core1_deadline))
         tight_loop_contents();
 
-    printf("[SMS] core1 launched started=%d\n", s_core1_started ? 1 : 0);
     if (!s_core1_started) {
         s_core1_run = false;
         multicore_reset_core1();
         snd_sms_close();
         system_shutdown();
         s_ring = NULL;
+        s_gg_scaled_prev = NULL;
+        s_gg_scaled_cur = NULL;
         s_linebuf = NULL;
         pb_vdp_ptr = NULL;
         show_core_error("Core1 failed to start");
@@ -883,14 +833,12 @@ void sms_core_run(void) {
 
     absolute_time_t fallback_next = make_timeout_time_us(16667);
     unsigned frame_counter = 0;
+    adaptive_frameskip_t auto_fs;
+    adaptive_frameskip_reset(&auto_fs);
     bool quit = false;
 
-    printf("[SMSDBG3] entering visible loop\n");
-
     while (!quit) {
-        if (frame_counter == 0u) printf("[SMSDBG3] buttons_update begin\n");
         buttons_update();
-        if (frame_counter == 0u) printf("[SMSDBG3] buttons_update done\n");
         uint16_t ev = buttons_pressed();
 
         if (ev & (1u << BTN_MENU)) {
@@ -901,50 +849,45 @@ void sms_core_run(void) {
                 quit = true;
                 break;
             }
+            adaptive_frameskip_reset(&auto_fs);
             buttons_update();
         }
 
         set_input(buttons_state());
 
         bool display_ready = (!s_frame_done && s_rd == s_wr);
-        bool fixed_skip = false;
-        if (g_settings.frameskip >= 0) {
+        const bool auto_mode = (g_settings.frameskip < 0);
+
+        bool render_request;
+        if (auto_mode) {
+            render_request = adaptive_frameskip_should_render(&auto_fs);
+        } else {
             unsigned period = (unsigned)g_settings.frameskip + 1u;
-            fixed_skip = ((frame_counter % period) != 0u);
+            render_request = ((frame_counter % period) == 0u);
         }
         frame_counter++;
 
-        // Auto (-1) renders whenever Core1 is ready. Fixed N skips N of every
-        // N+1 frames, and also drops rendering if display ever falls behind.
-        bool skip_render = fixed_skip || !display_ready;
+        // sms_frame(skip=1) bypasses SMS Plus rendering while CPU/VDP timing and
+        // audio continue. Auto therefore reduces real core work when pressured.
+        bool display_blocked = render_request && !display_ready;
+        bool skip_render = !render_request || !display_ready;
         s_stream_this = !skip_render;
 
-        if (frame_counter == 1u) {
-            s_boot_line_trace = true;
-            printf("[SMS] frame0 begin render=%d pc=%04x rom0=%02x %02x %02x %02x\n",
-                   s_stream_this ? 1 : 0,
-                   (unsigned)(z80_get_pc() & 0xFFFFu),
-                   cart.rom[0], cart.rom[1], cart.rom[2], cart.rom[3]);
-        }
-
         sms_frame(skip_render ? 1 : 0);
-
-        if (frame_counter == 1u) {
-            s_boot_line_trace = false;
-            printf("[SMS] frame0 done wr=%lu rd=%lu snd=%d pc=%04x\n",
-                   (unsigned long)s_wr, (unsigned long)s_rd, snd.enabled,
-                   (unsigned)(z80_get_pc() & 0xFFFFu));
-        }
 
         if (s_stream_this)
             s_frame_done = true;
 
-        // One SMS/GG frame is exactly 735 samples at the upstream 44.1-kHz /
-        // 60-Hz contract. Blocking on the previous DMA makes audio the master
-        // clock, matching PicoBoy's NES path.
         bool audio_paced = false;
         if (snd.enabled && snd.buffer[0] && snd.buffer[1])
             audio_paced = snd_sms_frame(snd.buffer[0], snd.buffer[1], snd.bufsize);
+
+        if (auto_mode) {
+            adaptive_frameskip_feedback(
+                &auto_fs,
+                adaptive_frameskip_signal(display_blocked,
+                                          audio_paced ? snd_dma_wait_us() : UINT32_MAX));
+        }
 
         if (!audio_paced) {
             sleep_until(fallback_next);
@@ -964,6 +907,8 @@ void sms_core_run(void) {
     system_shutdown();
 
     s_ring = NULL;
+    s_gg_scaled_prev = NULL;
+    s_gg_scaled_cur = NULL;
     s_linebuf = NULL;
     pb_vdp_ptr = NULL;
     led_set_state(LED_IDLE);

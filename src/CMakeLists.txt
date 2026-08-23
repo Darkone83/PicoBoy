@@ -66,6 +66,8 @@ add_executable(picoboy
     src/system.c
     src/vdp.c
     src/z80.c
+    src/usb_msc.c
+    src/usb_descriptors.c
 )
 
 # Compile the WS2812 PIO program into a generated header.
@@ -87,10 +89,12 @@ target_link_libraries(picoboy
     hardware_vreg
     hardware_dma
     hardware_adc
+    tinyusb_device
+    tinyusb_board
 )
 
 # Debug/console over USB CDC, not UART (no pins spent on the breadboard).
-pico_enable_stdio_usb(picoboy 1)
+pico_enable_stdio_usb(picoboy 0)
 pico_enable_stdio_uart(picoboy 0)
 
 # .uf2 / .elf / map etc.

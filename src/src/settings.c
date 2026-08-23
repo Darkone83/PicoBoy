@@ -15,7 +15,7 @@ settings_t g_settings;
 
 // ---------- NVS (top 4 KB sector) ----------
 #define NVS_MAGIC   0x59424F50u   // 'PBOY'
-#define NVS_VERSION 4u
+#define NVS_VERSION 7u
 
 typedef struct {
     uint32_t   magic;
@@ -23,6 +23,64 @@ typedef struct {
     uint16_t   size;       // sizeof(settings_t) — guards layout changes
     settings_t s;
 } nvs_hdr_t;
+
+// Previous v6 layout: both GG and NES display preferences, before USB SD Access.
+typedef struct {
+    uint8_t lcd_brightness;
+    uint8_t led_brightness;
+    uint8_t volume;
+    uint8_t palette;
+    int8_t  frameskip;
+    uint8_t theme;
+    uint8_t screensaver;
+    uint8_t gg_scaled;
+    uint8_t nes_scaled;
+} settings_v6_t;
+
+typedef struct {
+    uint32_t      magic;
+    uint16_t      version;
+    uint16_t      size;
+    settings_v6_t s;
+} nvs_hdr_v6_t;
+
+// Previous v5 layout. Preserve it so 1.0.4 development builds carrying the
+// persistent Game Gear display preference migrate cleanly to the NES preference.
+typedef struct {
+    uint8_t lcd_brightness;
+    uint8_t led_brightness;
+    uint8_t volume;
+    uint8_t palette;
+    int8_t  frameskip;
+    uint8_t theme;
+    uint8_t screensaver;
+    uint8_t gg_scaled;
+} settings_v5_t;
+
+typedef struct {
+    uint32_t      magic;
+    uint16_t      version;
+    uint16_t      size;
+    settings_v5_t s;
+} nvs_hdr_v5_t;
+
+// Pre-GG display layout, retained so users can also jump directly from v4.
+typedef struct {
+    uint8_t lcd_brightness;
+    uint8_t led_brightness;
+    uint8_t volume;
+    uint8_t palette;
+    int8_t  frameskip;
+    uint8_t theme;
+    uint8_t screensaver;
+} settings_v4_t;
+
+typedef struct {
+    uint32_t      magic;
+    uint16_t      version;
+    uint16_t      size;
+    settings_v4_t s;
+} nvs_hdr_v4_t;
 
 static bool s_dirty = false;
 
@@ -34,27 +92,89 @@ static void settings_defaults(void) {
     g_settings.frameskip      = -1;   // auto
     g_settings.theme          = 0;    // first built-in theme (Purple)
     g_settings.screensaver    = 1;    // idle animation on by default
+    g_settings.gg_scaled      = 0;    // Game Gear defaults to Native
+    g_settings.nes_scaled     = 0;    // NES defaults to Native
+    g_settings.usb_sd_access  = 0;    // USB is charge-only unless explicitly enabled
 }
 
 void settings_init(void) {
-    const nvs_hdr_t *h = (const nvs_hdr_t *)flash_ptr(NVS_FLASH_OFFSET);  // 4 KB-aligned, safe to overlay
-    if (h->magic == NVS_MAGIC && h->version == NVS_VERSION && h->size == sizeof(settings_t)) {
+    const nvs_hdr_t *h = (const nvs_hdr_t *)flash_ptr(NVS_FLASH_OFFSET);
+
+    if (h->magic == NVS_MAGIC &&
+        h->version == NVS_VERSION &&
+        h->size == sizeof(settings_t)) {
         g_settings = h->s;
-        // Clamp in case of a corrupt/partial write.
-        if (g_settings.lcd_brightness < 10)  g_settings.lcd_brightness = 10;
-        if (g_settings.lcd_brightness > 100) g_settings.lcd_brightness = 100;
-        if (g_settings.led_brightness > 100) g_settings.led_brightness = 100;
-        if (g_settings.volume > 100)         g_settings.volume = 100;
-        if (g_settings.palette > 13)         g_settings.palette = 0;
-        if (g_settings.frameskip < -1)       g_settings.frameskip = -1;
-        if (g_settings.frameskip > 5)        g_settings.frameskip = 5;
-        if (g_settings.screensaver > 1)      g_settings.screensaver = 1;
     } else {
-        settings_defaults();   // first boot / erased / version mismatch
+        const nvs_hdr_v6_t *v6 =
+            (const nvs_hdr_v6_t *)flash_ptr(NVS_FLASH_OFFSET);
+        const nvs_hdr_v5_t *v5 =
+            (const nvs_hdr_v5_t *)flash_ptr(NVS_FLASH_OFFSET);
+        const nvs_hdr_v4_t *v4 =
+            (const nvs_hdr_v4_t *)flash_ptr(NVS_FLASH_OFFSET);
+
+        if (v6->magic == NVS_MAGIC &&
+            v6->version == 6u &&
+            v6->size == sizeof(settings_v6_t)) {
+            // Preserve the already-validated GG/NES presentation settings.
+            g_settings.lcd_brightness = v6->s.lcd_brightness;
+            g_settings.led_brightness = v6->s.led_brightness;
+            g_settings.volume         = v6->s.volume;
+            g_settings.palette        = v6->s.palette;
+            g_settings.frameskip      = v6->s.frameskip;
+            g_settings.theme          = v6->s.theme;
+            g_settings.screensaver    = v6->s.screensaver;
+            g_settings.gg_scaled      = v6->s.gg_scaled;
+            g_settings.nes_scaled     = v6->s.nes_scaled;
+            g_settings.usb_sd_access  = 0;
+
+        } else if (v5->magic == NVS_MAGIC &&
+                   v5->version == 5u &&
+                   v5->size == sizeof(settings_v5_t)) {
+            g_settings.lcd_brightness = v5->s.lcd_brightness;
+            g_settings.led_brightness = v5->s.led_brightness;
+            g_settings.volume         = v5->s.volume;
+            g_settings.palette        = v5->s.palette;
+            g_settings.frameskip      = v5->s.frameskip;
+            g_settings.theme          = v5->s.theme;
+            g_settings.screensaver    = v5->s.screensaver;
+            g_settings.gg_scaled      = v5->s.gg_scaled;
+            g_settings.nes_scaled     = 0;
+            g_settings.usb_sd_access  = 0;
+
+        } else if (v4->magic == NVS_MAGIC &&
+                   v4->version == 4u &&
+                   v4->size == sizeof(settings_v4_t)) {
+            g_settings.lcd_brightness = v4->s.lcd_brightness;
+            g_settings.led_brightness = v4->s.led_brightness;
+            g_settings.volume         = v4->s.volume;
+            g_settings.palette        = v4->s.palette;
+            g_settings.frameskip      = v4->s.frameskip;
+            g_settings.theme          = v4->s.theme;
+            g_settings.screensaver    = v4->s.screensaver;
+            g_settings.gg_scaled      = 0;
+            g_settings.nes_scaled     = 0;
+            g_settings.usb_sd_access  = 0;
+        } else {
+            settings_defaults();
+        }
     }
+
+    // Clamp in case of a corrupt/partial write.
+    if (g_settings.lcd_brightness < 10)  g_settings.lcd_brightness = 10;
+    if (g_settings.lcd_brightness > 100) g_settings.lcd_brightness = 100;
+    if (g_settings.led_brightness > 100) g_settings.led_brightness = 100;
+    if (g_settings.volume > 100)         g_settings.volume = 100;
+    if (g_settings.palette > 13)         g_settings.palette = 0;
+    if (g_settings.frameskip < -1)       g_settings.frameskip = -1;
+    if (g_settings.frameskip > 5)        g_settings.frameskip = 5;
+    if (g_settings.screensaver > 1)      g_settings.screensaver = 1;
+    if (g_settings.gg_scaled > 1)        g_settings.gg_scaled = 0;
+    if (g_settings.nes_scaled > 1)       g_settings.nes_scaled = 0;
+    if (g_settings.usb_sd_access > 1)    g_settings.usb_sd_access = 0;
+
     if (g_settings.theme >= (uint8_t)theme_count()) g_settings.theme = 0;
-    theme_select(g_settings.theme);               // activate before any UI is drawn
-    led_set_idle_rgb565(g_theme->accent);         // static idle colour follows accent
+    theme_select(g_settings.theme);
+    led_set_idle_rgb565(g_theme->accent);
     led_set_idle_theme_mode(g_theme->led_mode);
 }
 
@@ -164,7 +284,7 @@ typedef struct {
     void      (*action)(void);  // IT_ACTION
 } item_t;
 
-#define N_ITEMS 7
+#define N_ITEMS 8
 static item_t items[N_ITEMS];
 
 static void build_items(void) {
@@ -172,9 +292,10 @@ static void build_items(void) {
     items[1] = (item_t){ "LED Bright",  IT_VALUE,  &g_settings.led_brightness, 0,  NULL };
     items[2] = (item_t){ "Volume",      IT_VALUE,  &g_settings.volume,         0,  NULL };
     items[3] = (item_t){ "Theme",       IT_CHOICE, &g_settings.theme,          0,  NULL };
-    items[4] = (item_t){ "Screensaver", IT_TOGGLE, &g_settings.screensaver,    0,  NULL };
-    items[5] = (item_t){ "Flash Ops",   IT_ACTION, NULL, 0, flash_ops_menu };
-    items[6] = (item_t){ "Diagnostics", IT_ACTION, NULL, 0, diagnostics_menu };
+    items[4] = (item_t){ "Screensaver",   IT_TOGGLE, &g_settings.screensaver,   0, NULL };
+    items[5] = (item_t){ "USB SD Access", IT_TOGGLE, &g_settings.usb_sd_access, 0, NULL };
+    items[6] = (item_t){ "Flash Ops",     IT_ACTION, NULL, 0, flash_ops_menu };
+    items[7] = (item_t){ "Diagnostics",   IT_ACTION, NULL, 0, diagnostics_menu };
 }
 
 static void draw(int sel) {
@@ -184,18 +305,18 @@ static void draw(int sel) {
         bool on = (i == sel);
         uint16_t fg = on ? g_theme->sel_fg : g_theme->item_fg;
         uint16_t bg = on ? g_theme->sel_bg : g_theme->bg;
-        if (on) ui_fill_pill(8, 52 + i * 24, 304, 20, bg);
+        if (on) ui_fill_pill(8, 46 + i * 22, 304, 18, bg);
         char body[40], line[44];
         if (items[i].kind == IT_VALUE)
-            snprintf(body, sizeof body, "%-11s %3u", items[i].label, (unsigned)*items[i].val);
+            snprintf(body, sizeof body, "%-13s %3u", items[i].label, (unsigned)*items[i].val);
         else if (items[i].kind == IT_CHOICE)
-            snprintf(body, sizeof body, "%-11s %s", items[i].label, theme_name((int)*items[i].val));
+            snprintf(body, sizeof body, "%-13s %s", items[i].label, theme_name((int)*items[i].val));
         else if (items[i].kind == IT_TOGGLE)
-            snprintf(body, sizeof body, "%-11s %s", items[i].label, *items[i].val ? "On" : "Off");
+            snprintf(body, sizeof body, "%-13s %s", items[i].label, *items[i].val ? "On" : "Off");
         else
-            snprintf(body, sizeof body, "%-11s   >", items[i].label);
+            snprintf(body, sizeof body, "%-13s   >", items[i].label);
         snprintf(line, sizeof line, "%c %s", on ? '>' : ' ', body);
-        st7789_draw_string(14, 52 + i * 24 + 6, line, fg, bg, 1);
+        st7789_draw_string(14, 46 + i * 22 + 6, line, fg, bg, 1);
     }
     ui_footer("U/D pick  L/R adj  A open  B back");
 }

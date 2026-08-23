@@ -11,8 +11,10 @@
 #include "settings.h"
 #include "version.h"
 #include "pins.h"
+#include "arena.h"
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
+#include "hardware/spi.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -317,7 +319,24 @@ void diag_tone(void) {
 
 // ---------------------------------------------------------------------------
 // SD diagnostic -- deliberately read-only. Never writes user media.
+//
+// Besides the original init/LBA0 probe, this includes a raw-driver throughput
+// benchmark. It intentionally bypasses FatFs so the result measures sd.c +
+// SPI/card behavior rather than filesystem traversal.
+//
+// The benchmark buffer borrows the shared emulator arena. Diagnostics runs from
+// the menu with no emulator core active, so this adds no large permanent buffer.
 // ---------------------------------------------------------------------------
+#define SD_BENCH_MAX_BLOCKS 128u               // 64 KiB buffer / transfer
+#define SD_BENCH_BUF_BYTES  (SD_BENCH_MAX_BLOCKS * 512u)
+
+typedef struct {
+    bool ok;
+    uint32_t single_kib_s;     // 64 x 512-byte calls
+    uint32_t bank16_kib_s;     // 8 x 16-KiB calls (GBC bank size)
+    uint32_t seq64_kib_s;      // 4 x 64-KiB calls
+} sd_bench_result_t;
+
 static void draw_sd_icon(uint16_t c) {
     int x = 34, y = 70, w = 76, h = 98;
     st7789_fill_rect(x, y + 12, w, h - 12, c);
@@ -336,53 +355,185 @@ static const char *sd_type_name(sd_type_t type) {
     }
 }
 
+// Measure repeated raw sd_read_blocks() calls. The transfer size is expressed in
+// 512-byte media blocks; each call advances to the next contiguous LBA range.
+//
+// Returning KiB/s keeps the UI integer-only and avoids pulling float formatting
+// into the firmware.
+static bool sd_bench_read(uint8_t *buf,
+                          uint32_t start_lba,
+                          uint32_t blocks_per_call,
+                          uint32_t calls,
+                          uint32_t *kib_s_out) {
+    if (!buf || !kib_s_out || blocks_per_call == 0 || calls == 0 ||
+        blocks_per_call > SD_BENCH_MAX_BLOCKS)
+        return false;
+
+    uint64_t total_blocks = (uint64_t)blocks_per_call * calls;
+    uint64_t total_bytes = total_blocks * 512u;
+
+    uint64_t t0 = time_us_64();
+
+    for (uint32_t i = 0; i < calls; i++) {
+        uint32_t lba = start_lba + i * blocks_per_call;
+        if (!sd_read_blocks(buf, lba, blocks_per_call))
+            return false;
+    }
+
+    uint64_t elapsed_us = time_us_64() - t0;
+    if (elapsed_us == 0)
+        elapsed_us = 1;
+
+    // KiB/s = bytes * 1,000,000 / elapsed_us / 1024.
+    uint64_t rate = (total_bytes * 1000000ull) / elapsed_us;
+    rate /= 1024ull;
+
+    if (rate > 0xFFFFFFFFull)
+        rate = 0xFFFFFFFFull;
+
+    *kib_s_out = (uint32_t)rate;
+    return true;
+}
+
+static sd_bench_result_t sd_run_benchmark(const sd_info_t *info) {
+    sd_bench_result_t r = {0};
+
+    if (!info || info->sectors < SD_BENCH_MAX_BLOCKS)
+        return r;
+
+    uint8_t *buf = arena_base();
+
+    // Prefer an LBA well clear of the partition/header area when the card is
+    // large enough. This is still READ ONLY; the actual contents do not matter.
+    //
+    // Reserve enough room for the largest benchmark span:
+    //   4 x 128 sectors = 512 sectors (256 KiB).
+    const uint32_t span = 512u;
+    uint32_t base = 0;
+    if (info->sectors > 4096u + span)
+        base = 4096u;
+
+    if (base + span > info->sectors)
+        base = 0;
+
+    if (base + span > info->sectors)
+        return r;
+
+    // 32 KiB total, but deliberately as 64 independent CMD17-sized requests.
+    // This exposes per-command/token/setup overhead.
+    if (!sd_bench_read(buf, base, 1u, 64u, &r.single_kib_s))
+        return r;
+
+    // 128 KiB total as eight 16-KiB calls. This exactly models the size of one
+    // GBC ROM-bank cache fill.
+    if (!sd_bench_read(buf, base, 32u, 8u, &r.bank16_kib_s))
+        return r;
+
+    // 256 KiB total as four 64-KiB calls. This shows larger sequential ceiling
+    // without requiring more than 64 KiB of the shared arena at once.
+    if (!sd_bench_read(buf, base, 128u, 4u, &r.seq64_kib_s))
+        return r;
+
+    r.ok = true;
+    return r;
+}
+
 static void sd_draw_base(void) {
     st7789_fill(g_theme->bg);
     ui_fill_bg(0, DIAG_TOP, LCD_W, DIAG_BOTTOM - DIAG_TOP);
     ui_header("SD Card");
     draw_sd_icon(g_theme->accent);
-    st7789_draw_string(128, 72, "Read-only hardware test", g_theme->item_fg, g_theme->bg, 1);
-    st7789_draw_string(128, 94, "Init card + read LBA 0", g_theme->footer_fg, g_theme->bg, 1);
-    st7789_draw_string(128, 122, "Press A to probe", g_theme->accent, g_theme->bg, 1);
-    ui_footer("A probe   B back");
+    st7789_draw_string(128, 68, "Read-only hardware test", g_theme->item_fg, g_theme->bg, 1);
+    st7789_draw_string(128, 88, "Probe + raw read speed", g_theme->footer_fg, g_theme->bg, 1);
+    st7789_draw_string(128, 112, "Press A to test", g_theme->accent, g_theme->bg, 1);
+    ui_footer("A test   B back");
 }
 
 void diag_sd(void) {
     sd_draw_base();
+
     while (true) {
         buttons_update();
         uint16_t ev = buttons_pressed();
-        if (ev & (1u << BTN_B)) { diag_restore_theme_led(); return; }
+
+        if (ev & (1u << BTN_B)) {
+            diag_restore_theme_led();
+            return;
+        }
+
         if (ev & (1u << BTN_A)) {
-            ws2812_set(60, 18, 36); // pink: probe in progress
-            st7789_fill_rect(120, 118, 192, 78, g_theme->bg);
-            st7789_draw_string(128, 122, "Probing...", g_theme->warn, g_theme->bg, 1);
+            ws2812_set(60, 18, 36); // pink: probe/benchmark in progress
+
+            st7789_fill_rect(120, 106, 198, 108, g_theme->bg);
+            st7789_draw_string(128, 112, "Probing...", g_theme->warn, g_theme->bg, 1);
 
             sd_info_t info;
-            uint8_t sector[512];
+            uint8_t *sector = arena_base();
+
             bool init_ok = sd_init(&info);
             bool read_ok = init_ok && sd_read_blocks(sector, 0, 1);
-            bool ok = init_ok && read_ok;
 
-            st7789_fill_rect(120, 118, 192, 82, g_theme->bg);
-            if (ok) {
-                ws2812_set(0, 56, 0);
-                st7789_draw_string(128, 120, "PASS", g_theme->ok, g_theme->bg, 2);
-                char line[40];
-                snprintf(line, sizeof line, "%s", sd_type_name(info.type));
-                st7789_draw_string(128, 148, line, g_theme->item_fg, g_theme->bg, 1);
-                if (info.mb >= 1024)
-                    snprintf(line, sizeof line, "%lu GB  read OK", (unsigned long)(info.mb / 1024));
-                else
-                    snprintf(line, sizeof line, "%lu MB  read OK", (unsigned long)info.mb);
-                st7789_draw_string(128, 166, line, g_theme->footer_fg, g_theme->bg, 1);
-            } else {
+            if (!init_ok || !read_ok) {
                 ws2812_set(60, 0, 0);
-                st7789_draw_string(128, 120, "FAIL", g_theme->err, g_theme->bg, 2);
-                st7789_draw_string(128, 150, init_ok ? "Sector read failed" : "Card init failed",
+                st7789_fill_rect(120, 106, 198, 108, g_theme->bg);
+                st7789_draw_string(128, 112, "FAIL", g_theme->err, g_theme->bg, 2);
+                st7789_draw_string(128, 142,
+                                   init_ok ? "Sector read failed" : "Card init failed",
                                    g_theme->item_fg, g_theme->bg, 1);
+                sleep_ms(15);
+                continue;
             }
+
+            st7789_fill_rect(120, 106, 198, 108, g_theme->bg);
+            st7789_draw_string(128, 112, "Benchmarking...", g_theme->warn, g_theme->bg, 1);
+
+            sd_bench_result_t bench = sd_run_benchmark(&info);
+
+            st7789_fill_rect(120, 106, 198, 108, g_theme->bg);
+
+            if (!bench.ok) {
+                ws2812_set(60, 0, 0);
+                st7789_draw_string(128, 112, "READ FAIL", g_theme->err, g_theme->bg, 1);
+                st7789_draw_string(128, 136, sd_type_name(info.type),
+                                   g_theme->item_fg, g_theme->bg, 1);
+                st7789_draw_string(128, 156, "Benchmark aborted",
+                                   g_theme->footer_fg, g_theme->bg, 1);
+                sleep_ms(15);
+                continue;
+            }
+
+            ws2812_set(0, 56, 0);
+
+            char line[40];
+            st7789_draw_string(128, 108, "PASS", g_theme->ok, g_theme->bg, 1);
+
+            if (info.mb >= 1024)
+                snprintf(line, sizeof line, "%s  %lu GB",
+                         sd_type_name(info.type), (unsigned long)(info.mb / 1024));
+            else
+                snprintf(line, sizeof line, "%s  %lu MB",
+                         sd_type_name(info.type), (unsigned long)info.mb);
+            st7789_draw_string(128, 126, line, g_theme->item_fg, g_theme->bg, 1);
+
+            uint32_t spi_hz = spi_get_baudrate(SD_SPI);
+            snprintf(line, sizeof line, "SPI     %lu.%lu MHz",
+                     (unsigned long)(spi_hz / 1000000u),
+                     (unsigned long)((spi_hz / 100000u) % 10u));
+            st7789_draw_string(128, 144, line, g_theme->footer_fg, g_theme->bg, 1);
+
+            snprintf(line, sizeof line, "512B    %lu KiB/s",
+                     (unsigned long)bench.single_kib_s);
+            st7789_draw_string(128, 162, line, g_theme->item_fg, g_theme->bg, 1);
+
+            snprintf(line, sizeof line, "16K     %lu KiB/s",
+                     (unsigned long)bench.bank16_kib_s);
+            st7789_draw_string(128, 180, line, g_theme->item_fg, g_theme->bg, 1);
+
+            snprintf(line, sizeof line, "64K     %lu KiB/s",
+                     (unsigned long)bench.seq64_kib_s);
+            st7789_draw_string(128, 198, line, g_theme->item_fg, g_theme->bg, 1);
         }
+
         sleep_ms(15);
     }
 }

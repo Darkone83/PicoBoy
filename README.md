@@ -5,7 +5,7 @@
 </div>
 
 A tiny handheld multi-system emulator built around a bare RP2040. PicoBoy plays
-**Game Boy**, **NES / Famicom**, **Atari 2600**, **Sega Master System**, and
+**Game Boy / Game Boy Color**, **NES / Famicom**, **Atari 2600**, **Sega Master System**, and
 **Game Gear** games from microSD, with a shared one-core-at-a-time architecture
 designed to make the most of the RP2040's limited RAM.
 
@@ -20,7 +20,7 @@ designed to make the most of the RP2040's limited RAM.
 
 ## Features
 
-- **Five emulation families** — Game Boy, NES / Famicom, Atari 2600, Sega Master System, and Game Gear
+- **Five emulation families** — Game Boy / Game Boy Color, NES / Famicom, Atari 2600, Sega Master System, and Game Gear (Game Boy Color core support is experimental)
 - **ROM loading from microSD** with per-system folders and *Load last game*
 - **Battery saves and save states** for supported Game Boy, NES / Famicom, Master System, and Game Gear titles
 - **In-game menu** — pause, brightness, volume, frame-skip, save-state and system-specific options
@@ -76,6 +76,7 @@ inserted. If you want to lay the card out yourself first, the 1.0.4 structure is
 SD card root
 ├── roms/
 │   ├── gb/      <- Game Boy ROMs       (.gb)
+|	├── gbc/     <- Game Boy  Color ROMs(.gbc)
 │   ├── nes/     <- NES ROMs            (.nes)
 │   ├── fc/      <- Famicom ROMs        (.nes)
 │   ├── sms/     <- Master System ROMs  (.sms)
@@ -83,11 +84,13 @@ SD card root
 │   └── 2600/    <- Atari 2600 ROMs     (.a26, .bin)
 ├── save/        <- battery saves (created automatically)
 │   ├── gb/
+│   ├── gbc/
 │   ├── nes/
 │   ├── sms/
 │   └── gg/
 └── state/       <- save states (created automatically)
     ├── gb/
+	├── gbc/
     ├── nes/
     ├── sms/
     └── gg/
@@ -200,7 +203,6 @@ grows, while still giving every core the same staged-ROM interface.
 /src        Main project source
 /firmware   Precompiled UF2
 /images     Project images
-/tools      Development tools and helpers
 /pcb        Gerbers, BOM, and pick-and-place
 /stl        Enclosure files (coming soon)
 ```

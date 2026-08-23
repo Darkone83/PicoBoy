@@ -30,7 +30,8 @@ typedef struct {
 } sys_t;
 
 static const sys_t SYS[] = {
-    { "Game Boy",      "gb",   ".gb",  NULL,   true  },
+    { "Game Boy",       "gb",   ".gb",  NULL,   true  },
+    { "Game Boy Color", "gbc",  ".gbc", NULL,   true  },
     { "NES",           "nes",  ".nes", NULL,   true  },
     { "Master System", "sms",  ".sms", NULL,   true  },
     { "Game Gear",     "gg",   ".gg",  NULL,   true  },
@@ -61,7 +62,12 @@ static FATFS s_fs;
 // than its own 4 KB of BSS: flashing only runs from the menu, before any core
 // launches, so the arena is free at that point (the core re-inits it on run).
 static uint8_t *s_secbuf = 0;
-static uint32_t s_last_flash_size = 0; // size of the most recently flashed ROM
+
+// Geometry of the most recently staged image.
+// For every existing system total == flash. Large GBC is the only split case.
+static uint32_t s_last_rom_size = 0;
+static uint32_t s_last_flash_size = 0;
+#define GB_ROM_BANK_BYTES 0x4000u
 
 // ---- small UI helpers ----------------------------------------------------
 #define ROWS_VISIBLE 10
@@ -255,17 +261,32 @@ static void strip_ext(char *out, size_t n, const char *romfile) {
 // Remember the last launched game (sys + base name) so "Load last game" can
 // restore both the correct emulator and the staged ROM size. Atari needs the
 // staged size because its cartridge detector works from the raw image length.
-static void persist_last(const char *sysdir, const char *base) {
+static void persist_last(const char *sysdir,
+                         const char *base,
+                         const char *full_path) {
     FIL f;
     if (f_open(&f, "/lastrom.txt", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
-        // "<sys>/<base>\n<flash size>\n<ROM flash offset>"
-        // Recording the dynamic base invalidates stale staged images after a
-        // firmware update changes __flash_binary_end.
-        char line[MAX_NAME + 40];
-        int len = snprintf(line, sizeof line, "%s/%s\n%lu\n%lu",
+        /*
+         * v2 text metadata:
+         *   <sys>/<base>
+         *   <total ROM size>
+         *   <ROM flash offset>
+         *   <bytes staged in flash>
+         *   <original SD path, blank when not required>
+         *
+         * Old all-flash entries remain easy to recognise because total == flash.
+         */
+        char line[(MAX_NAME * 2) + 128];
+        const char *path =
+            (s_last_flash_size < s_last_rom_size && full_path) ? full_path : "";
+
+        int len = snprintf(line, sizeof line,
+                           "%s/%s\n%lu\n%lu\n%lu\n%s",
                            sysdir, base,
+                           (unsigned long)s_last_rom_size,
+                           (unsigned long)rom_flash_offset(),
                            (unsigned long)s_last_flash_size,
-                           (unsigned long)rom_flash_offset());
+                           path);
         UINT bw = 0;
         f_write(&f, line, (UINT)len, &bw);
         f_close(&f);
@@ -346,7 +367,7 @@ static int scan_dir(const char *path, const char *ext, const char *ext2) {
 // Stream a ROM file into the flash window, erasing + programming a sector at a
 // time. Runs with core1 idle (we're in the menu), so the single-core flash ops
 // are safe. Returns true on success.
-static bool flash_from_sd(const char *path) {
+static bool stage_rom_from_sd(const char *path, bool allow_gbc_split) {
     FIL fil;
 
     if (f_open(&fil, path, FA_READ) != FR_OK) {
@@ -359,66 +380,88 @@ static bool flash_from_sd(const char *path) {
     const uint32_t rom_base = rom_flash_offset();
     const uint32_t window   = rom_flash_capacity();
 
-    // Flash is erased in complete 4 KiB sectors, so validate the rounded write,
-    // not just the raw file length.
-    uint32_t staged_bytes = 0;
-    if (size != 0 && size <= UINT32_MAX - (FLASH_SECTOR_SIZE - 1u))
-        staged_bytes = (size + FLASH_SECTOR_SIZE - 1u) &
-                       ~(uint32_t)(FLASH_SECTOR_SIZE - 1u);
+    if (size == 0 || rom_base >= NVS_FLASH_OFFSET || window < FLASH_SECTOR_SIZE) {
+        f_close(&fil);
+        show_msg("ROM Loader",
+                 size == 0 ? "Empty file" : "No safe ROM flash window",
+                 COL_RED);
+        return false;
+    }
+
+    // Existing systems keep the proven all-flash staging path.
+    // Large GBC may use the largest complete 16-KiB bank-aligned prefix that
+    // fits the safe dynamic window. This ensures Peanut's mapped ROM bank is
+    // always wholly XIP or wholly SD-backed.
+    uint32_t flash_bytes = size;
+    bool split = false;
+
+    uint32_t full_rounded =
+        (size <= UINT32_MAX - (FLASH_SECTOR_SIZE - 1u))
+        ? ((size + FLASH_SECTOR_SIZE - 1u) &
+           ~(uint32_t)(FLASH_SECTOR_SIZE - 1u))
+        : 0u;
+
+    if (full_rounded == 0 || full_rounded > window) {
+        if (!allow_gbc_split) {
+            f_close(&fil);
+            char msg[48];
+            snprintf(msg, sizeof msg, "ROM too big (%luK free)",
+                     (unsigned long)(window / 1024u));
+            show_msg("ROM Loader", msg, COL_RED);
+            return false;
+        }
+
+        flash_bytes = window & ~(uint32_t)(GB_ROM_BANK_BYTES - 1u);
+        if (flash_bytes < (2u * GB_ROM_BANK_BYTES) || flash_bytes >= size) {
+            f_close(&fil);
+            show_msg("GBC Loader", "Split window unavailable", COL_RED);
+            return false;
+        }
+        split = true;
+    }
+
+    // In split mode flash_bytes is 16-KiB aligned and therefore also 4-KiB
+    // sector aligned. In all-flash mode program through the final partial sector.
+    uint32_t program_bytes = split ? flash_bytes : full_rounded;
 
     printf("[FLASH] total=%lu fw_end=0x%06lx rom_base=0x%06lx "
-           "nvs=0x%06lx capacity=%lu rom=%lu staged=%lu\n",
+           "nvs=0x%06lx capacity=%lu rom=%lu flash=%lu split=%u\n",
            (unsigned long)PICO_FLASH_SIZE_BYTES,
            (unsigned long)fw_end,
            (unsigned long)rom_base,
            (unsigned long)NVS_FLASH_OFFSET,
            (unsigned long)window,
            (unsigned long)size,
-           (unsigned long)staged_bytes);
-
-    if (size == 0 || staged_bytes == 0 ||
-        rom_base >= NVS_FLASH_OFFSET ||
-        staged_bytes > window) {
-        f_close(&fil);
-
-        if (size == 0) {
-            show_msg("ROM Loader", "Empty file", COL_RED);
-        } else if (rom_base >= NVS_FLASH_OFFSET) {
-            show_msg("ROM Loader", "No safe ROM flash window", COL_RED);
-        } else {
-            char msg[48];
-            snprintf(msg, sizeof msg, "ROM too big (%luK free)",
-                     (unsigned long)(window / 1024u));
-            show_msg("ROM Loader", msg, COL_RED);
-        }
-        return false;
-    }
+           (unsigned long)flash_bytes,
+           split ? 1u : 0u);
 
     led_set_state(LED_FLASH_BUSY);
-
-    // Borrow the arena for sector staging. No core is running here.
     s_secbuf = arena_base();
 
     st7789_fill(g_theme->bg);
-    ui_header("Loading ROM");
+    ui_header(split ? "Loading GBC (split)" : "Loading ROM");
     ui_footer("");
 
-    uint32_t total = (size + FLASH_SECTOR_SIZE - 1) / FLASH_SECTOR_SIZE;
+    uint32_t total = program_bytes / FLASH_SECTOR_SIZE;
     uint32_t done = 0;
-
     ui_progress_pacman(0, (int)total);
 
     bool ok = true;
     bool verify_failed = false;
 
-    for (uint32_t off = 0; off < size; off += FLASH_SECTOR_SIZE) {
+    for (uint32_t off = 0; off < program_bytes; off += FLASH_SECTOR_SIZE) {
         UINT br = 0;
-        uint32_t remain = size - off;
-        UINT want = (UINT)(remain < FLASH_SECTOR_SIZE ? remain : FLASH_SECTOR_SIZE);
 
-        if (f_read(&fil, s_secbuf, want, &br) != FR_OK || br != want) {
-            ok = false;
-            break;
+        uint32_t remain_file = (off < size) ? (size - off) : 0u;
+        UINT want = (UINT)(remain_file < FLASH_SECTOR_SIZE
+                         ? remain_file
+                         : FLASH_SECTOR_SIZE);
+
+        if (want) {
+            if (f_read(&fil, s_secbuf, want, &br) != FR_OK || br != want) {
+                ok = false;
+                break;
+            }
         }
 
         if (want < FLASH_SECTOR_SIZE)
@@ -426,19 +469,12 @@ static bool flash_from_sd(const char *path) {
 
         uint32_t dst = rom_base + off;
 
-        // Fail closed before *every* erase/program operation. This protects both
-        // the linked firmware below rom_base and the NVS sector above the window.
         if (!rom_flash_range_valid(dst, FLASH_SECTOR_SIZE)) {
-            printf("[FLASH] REFUSED sector dst=0x%06lx len=%u\n",
-                   (unsigned long)dst, (unsigned)FLASH_SECTOR_SIZE);
             verify_failed = true;
             break;
         }
 
         bool verified = false;
-
-        // Program one complete sector, verify the XIP view, and retry once
-        // before reporting a flash failure.
         for (int attempt = 0; attempt < 2; attempt++) {
             flash_erase_sector(dst);
             flash_program_sector(dst, s_secbuf);
@@ -469,8 +505,8 @@ static bool flash_from_sd(const char *path) {
         return false;
     }
 
-    // Only publish the staged size after every sector has verified.
-    s_last_flash_size = size;
+    s_last_rom_size = size;
+    s_last_flash_size = split ? flash_bytes : size;
     return true;
 }
 
@@ -545,11 +581,13 @@ void loader_browse(void) {
 
         ui_transition(UI_TRANSITION_FORWARD);
 
-        if (flash_from_sd(full)) {
+        bool is_gbc = (strcmp(SYS[s].dir, "gbc") == 0);
+
+        if (stage_rom_from_sd(full, is_gbc)) {
             char base[MAX_NAME];
             strip_ext(base, sizeof base, selected);
 
-            persist_last(SYS[s].dir, base);
+            persist_last(SYS[s].dir, base, full);
             ui_set_now_playing(base);            // shown in the in-game pause overlay
             led_set_state(LED_RUNNING);
 
@@ -572,7 +610,7 @@ void loader_browse(void) {
                          "/save/%s/%s.srm", SYS[s].dir, base);
                 snprintf(dat, sizeof dat,
                          "/state/%s/%s.dat", SYS[s].dir, base);
-                sms_core_set_rom(s_last_flash_size, strcmp(SYS[s].dir, "gg") == 0);
+                sms_core_set_rom(s_last_rom_size, strcmp(SYS[s].dir, "gg") == 0);
                 sms_core_set_save_path(srm);
                 sms_core_set_state_path(dat);
                 sms_core_run();
@@ -580,7 +618,7 @@ void loader_browse(void) {
             } else if (strcmp(SYS[s].dir, "2600") == 0) {
                 // Atari runs directly from the same staged XIP ROM window.
                 // Its mapper detector needs the exact raw file size.
-                atari_core_set_rom_size(s_last_flash_size);
+                atari_core_set_rom_size(s_last_rom_size);
                 atari_core_run();
 
             } else {
@@ -594,6 +632,10 @@ void loader_browse(void) {
 
                 gb_set_save_path(srm);
                 gb_set_state_path(dat);
+                gb_set_rom_source(s_last_rom_size,
+                                  s_last_flash_size,
+                                  is_gbc && s_last_flash_size < s_last_rom_size
+                                      ? full : "");
                 gb_core_run();
             }
         }
@@ -616,12 +658,17 @@ void loader_launch_last(void) {
 
     int sys_kind = SYSK_GB;
     bool last_is_gg = false;
-    uint32_t staged_size = 0;
+    bool last_is_gbc = false;
+
+    uint32_t rom_size = 0;
     uint32_t staged_offset = 0;
-    bool have_last = false;   // set once we resolve a valid <sys>/<base> from /lastrom.txt
+    uint32_t flash_prefix = 0;
+    char split_path[MAX_NAME + 48] = {0};
+    bool have_last = false;
 
     gb_set_save_path("");
     gb_set_state_path("");
+    gb_set_rom_source(0, 0, "");
     nes_set_save_path("");
     nes_set_state_path("");
     sms_core_set_rom(0, false);
@@ -633,82 +680,106 @@ void loader_launch_last(void) {
         FIL f;
 
         if (f_open(&f, "/lastrom.txt", FA_READ) == FR_OK) {
-            char line[MAX_NAME + 40];
+            char data[(MAX_NAME * 2) + 128];
             UINT br = 0;
-
-            f_read(&f, line, sizeof line - 1, &br);
+            f_read(&f, data, sizeof data - 1, &br);
             f_close(&f);
+            data[br] = '\0';
 
-            line[br] = '\0';
+            // Parse line-by-line. Old 3-line metadata is accepted as all-flash:
+            //   sys/base, size, flash_offset
+            // New 5-line metadata adds flash_prefix and optional split SD path.
+            char *line1 = data;
+            char *line2 = strchr(line1, '\n');
+            char *line3 = NULL;
+            char *line4 = NULL;
+            char *line5 = NULL;
 
-            // File:
-            //   <sys>/<base>
-            //   <staged flash size>
-            //   <ROM flash offset used when staged>
-            char *nl = strchr(line, '\n');
+            if (line2) {
+                *line2++ = '\0';
+                line3 = strchr(line2, '\n');
+            }
+            if (line3) {
+                *line3++ = '\0';
+                line4 = strchr(line3, '\n');
+            }
+            if (line4) {
+                *line4++ = '\0';
+                line5 = strchr(line4, '\n');
+            }
+            if (line5)
+                *line5++ = '\0';
 
-            if (nl) {
-                *nl++ = '\0';
+            if (line2)
+                rom_size = (uint32_t)strtoul(line2, NULL, 10);
+            if (line3)
+                staged_offset = (uint32_t)strtoul(line3, NULL, 10);
 
-                // Tolerate CRLF or whitespace before the decimal size.
-                while (*nl == '\r' || *nl == ' ' || *nl == '\t')
-                    nl++;
-
-                staged_size = (uint32_t)strtoul(nl, NULL, 10);
-
-                char *nl2 = strchr(nl, '\n');
-                if (nl2) {
-                    nl2++;
-                    while (*nl2 == '\r' || *nl2 == ' ' || *nl2 == '\t')
-                        nl2++;
-                    staged_offset = (uint32_t)strtoul(nl2, NULL, 10);
-                }
+            if (line4) {
+                flash_prefix = (uint32_t)strtoul(line4, NULL, 10);
+                if (line5)
+                    snprintf(split_path, sizeof split_path, "%s", line5);
+            } else {
+                // v1 metadata: whole image was staged.
+                flash_prefix = rom_size;
             }
 
-            // Trim trailing CR/space from the name line.
-            int nlen = 0;
-            while (line[nlen]) nlen++;
-
-            while (nlen &&
-                   (line[nlen - 1] == '\r' ||
-                    line[nlen - 1] == ' ')) {
-                line[--nlen] = '\0';
+            // trim CR/space on every parsed string field
+            for (char *p = line1; p && *p; ) {
+                char *e = p + strlen(p);
+                while (e > p && (e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'))
+                    *--e = '\0';
+                break;
+            }
+            {
+                char *e = split_path + strlen(split_path);
+                while (e > split_path &&
+                       (e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'))
+                    *--e = '\0';
             }
 
-            char *slash = strchr(line, '/');
+            char *slash = strchr(line1, '/');
 
             if (slash) {
                 *slash = '\0';
-
-                const char *sysdir = line;
+                const char *sysdir = line1;
                 const char *base = slash + 1;
 
                 ui_set_now_playing(base);
 
-                // A firmware update can move the dynamic ROM window. Never boot
-                // stale bytes from the old offset; require the metadata written
-                // by the current staging scheme and verify its range.
-                uint32_t rounded = 0;
-                if (staged_size != 0 &&
-                    staged_size <= UINT32_MAX - (FLASH_SECTOR_SIZE - 1u)) {
-                    rounded = (staged_size + FLASH_SECTOR_SIZE - 1u) &
-                              ~(uint32_t)(FLASH_SECTOR_SIZE - 1u);
+                uint32_t rounded_prefix = 0;
+                if (flash_prefix != 0 &&
+                    flash_prefix <= UINT32_MAX - (FLASH_SECTOR_SIZE - 1u)) {
+                    rounded_prefix =
+                        (flash_prefix + FLASH_SECTOR_SIZE - 1u) &
+                        ~(uint32_t)(FLASH_SECTOR_SIZE - 1u);
                 }
 
-                have_last =
+                bool flash_valid =
                     (staged_offset == rom_flash_offset()) &&
-                    (rounded != 0) &&
-                    (rounded <= rom_flash_capacity());
+                    (rom_size != 0) &&
+                    (flash_prefix != 0) &&
+                    (flash_prefix <= rom_size) &&
+                    (rounded_prefix != 0) &&
+                    (rounded_prefix <= rom_flash_capacity());
 
-                if (!have_last) {
-                    printf("[FLASH] last ROM stale/unsafe: saved_base=0x%06lx "
-                           "current_base=0x%06lx size=%lu\n",
-                           (unsigned long)staged_offset,
-                           (unsigned long)rom_flash_offset(),
-                           (unsigned long)staged_size);
+                bool split = flash_prefix < rom_size;
+                bool split_valid = true;
+
+                if (split) {
+                    FILINFO fi;
+                    split_valid =
+                        (strcmp(sysdir, "gbc") == 0) &&
+                        ((flash_prefix & (GB_ROM_BANK_BYTES - 1u)) == 0) &&
+                        split_path[0] &&
+                        (f_stat(split_path, &fi) == FR_OK) &&
+                        ((uint32_t)fi.fsize == rom_size);
                 }
 
-                if (strcmp(sysdir, "nes") == 0 || strcmp(sysdir, "fc") == 0) {
+                have_last = flash_valid && split_valid;
+
+                if (strcmp(sysdir, "nes") == 0 ||
+                    strcmp(sysdir, "fc") == 0) {
                     sys_kind = SYSK_NES;
 
                     char srm[96], dat[96];
@@ -719,7 +790,8 @@ void loader_launch_last(void) {
                     nes_set_save_path(srm);
                     nes_set_state_path(dat);
 
-                } else if (strcmp(sysdir, "sms") == 0 || strcmp(sysdir, "gg") == 0) {
+                } else if (strcmp(sysdir, "sms") == 0 ||
+                           strcmp(sysdir, "gg") == 0) {
                     sys_kind = SYSK_SMS;
                     last_is_gg = (strcmp(sysdir, "gg") == 0);
 
@@ -736,24 +808,25 @@ void loader_launch_last(void) {
 
                 } else {
                     sys_kind = SYSK_GB;
+                    last_is_gbc = (strcmp(sysdir, "gbc") == 0);
 
                     char srm[96], dat[96];
                     snprintf(srm, sizeof srm,
                              "/save/%s/%s.srm", sysdir, base);
                     snprintf(dat, sizeof dat,
                              "/state/%s/%s.dat", sysdir, base);
-
                     gb_set_save_path(srm);
                     gb_set_state_path(dat);
+                    gb_set_rom_source(rom_size,
+                                      flash_prefix,
+                                      split ? split_path : "");
                 }
             }
         }
     }
 
     if (!have_last) {
-        // No /lastrom.txt yet (fresh device or card absent): point the player at
-        // Browse ROMs instead of dropping into a core's "no ROM staged" error.
-        show_msg("Load last game", "No recent game - Browse ROMs", COL_GRAY);
+        show_msg("Load last game", "Reopen from Browse ROMs", COL_GRAY);
         return;
     }
 
@@ -763,27 +836,15 @@ void loader_launch_last(void) {
         nes_run();
 
     } else if (sys_kind == SYSK_SMS) {
-        if (staged_size == 0) {
-            show_msg(last_is_gg ? "Game Gear" : "Master System",
-                     "Reopen from Browse ROMs", COL_RED);
-            return;
-        }
-
-        sms_core_set_rom(staged_size, last_is_gg);
+        sms_core_set_rom(rom_size, last_is_gg);
         sms_core_run();
 
     } else if (sys_kind == SYSK_ATARI) {
-        if (staged_size == 0) {
-            // Old /lastrom.txt from before Atari size metadata is not safe to
-            // guess: 2600 mapper selection depends heavily on image size.
-            show_msg("Atari 2600", "Reopen from Browse ROMs", COL_RED);
-            return;
-        }
-
-        atari_core_set_rom_size(staged_size);
+        atari_core_set_rom_size(rom_size);
         atari_core_run();
 
     } else {
+        (void)last_is_gbc; // CGB mode is selected by the cartridge header.
         gb_core_run();
     }
 }

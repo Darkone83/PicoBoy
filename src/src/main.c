@@ -18,6 +18,7 @@
 #include "battery.h"
 #include "theme.h"
 #include "version.h"
+#include "usb_msc.h"
 
 // The one shared emulator RAM arena (see arena.h). Defined here so it needs no
 // new source file in the build; cores carve their big buffers from it.
@@ -36,7 +37,7 @@ static void load_last_game(void) {
 // LCD SPI can clock well above 24 MHz (the PL022 divides it down to LCD_SPI_HZ).
 // PIO (audio + LED) runs off clk_sys too; its dividers are set at init, after
 // this, so they stay correct. The PIO/SPI init below all runs after this.
-#define PICOBOY_SYS_CLK_KHZ 285000
+#define PICOBOY_SYS_CLK_KHZ 292000
 static void overclock(void) {
     vreg_set_voltage(VREG_VOLTAGE_1_30);   // headroom for the overclock
     sleep_ms(10);                          // let the regulator settle
@@ -330,13 +331,44 @@ int main(void) {
 
     uint32_t last_input = to_ms_since_boot(get_absolute_time());
     while (true) {
+        // USB SD Access is deliberately main-menu-only. With the setting Off,
+        // MSC remains software-disconnected/charge-only; on a fresh boot TinyUSB
+        // is not initialized until USB SD Access is first armed. No CDC/COM port
+        // is exposed in either state.
+        if (usb_msc_menu_task(g_settings.usb_sd_access != 0)) {
+            usb_msc_mode_wait();
+            led_set_state(LED_IDLE);
+            ui_draw_menu(&main_menu);
+            last_input = to_ms_since_boot(get_absolute_time());
+            continue;
+        }
+
         buttons_update();
         uint16_t ev = buttons_pressed();
+        uint16_t held = buttons_state();
         if (ev) last_input = to_ms_since_boot(get_absolute_time());
+
+        // B exits USB storage without changing the persistent setting. Holding
+        // START+MENU from the main menu explicitly re-arms the MSC personality.
+        // A latch makes this a one-shot action even if both buttons stay held.
+        static bool usb_rearm_combo_latched = false;
+        const uint16_t usb_rearm_mask =
+            (uint16_t)((1u << BTN_START) | (1u << BTN_MENU));
+        bool usb_rearm_combo = (held & usb_rearm_mask) == usb_rearm_mask;
+
+        if (usb_rearm_combo && !usb_rearm_combo_latched) {
+            usb_msc_rearm();
+            last_input = to_ms_since_boot(get_absolute_time());
+        }
+        usb_rearm_combo_latched = usb_rearm_combo;
 
         if ((ev & (1u << BTN_UP))   && ui_menu_move(&main_menu, -1)) ui_draw_menu(&main_menu);
         if ((ev & (1u << BTN_DOWN)) && ui_menu_move(&main_menu,  1)) ui_draw_menu(&main_menu);
         if (ev & (1u << BTN_A)) {
+            // Never leave a live USB block device behind while FatFs or an
+            // emulator may touch the SD card.
+            usb_msc_pause();
+
             switch (main_menu.sel) {
                 case 0:
                     ui_transition(UI_TRANSITION_FORWARD);
@@ -366,10 +398,11 @@ int main(void) {
 
         if (g_settings.screensaver &&
             to_ms_since_boot(get_absolute_time()) - last_input > SCREENSAVER_MS) {
+            usb_msc_pause();
             screensaver_run();                        // returns when a button wakes it
             last_input = to_ms_since_boot(get_absolute_time());
             ui_draw_menu(&main_menu);                 // repaint; the wake press is consumed
         }
-        sleep_ms(15);
+        sleep_ms(g_settings.usb_sd_access ? 1 : 15);
     }
 }

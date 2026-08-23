@@ -2,11 +2,17 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Sound path: minigb_apu (Game Boy APU) rendered to PCM, scaled by the Volume
-// setting, and pushed to the MAX98357 over DMA-driven I2S (third_party/i2s).
+// Shared PicoBoy sound path: active emulator audio is converted to PCM, scaled
+// by the Volume setting, and pushed to the MAX98357 over DMA-driven I2S.
 
 // Idempotent: bring up the I2S DMA driver (claims a pio1 SM + one DMA channel).
 void snd_init(void);
+
+// Time spent waiting for the previous gameplay DMA transfer to drain.
+// UINT32_MAX means no valid pacing sample has been produced since the current
+// core opened. Auto frame skip uses this as a lightweight real-time headroom
+// signal; callers should treat it as advisory, not an audio timing contract.
+uint32_t snd_dma_wait_us(void);
 
 // Reset the APU channel state. Call at the start of each game.
 void snd_apu_reset(void);

@@ -8,10 +8,11 @@
 #include "hardware/pio.h"
 #include <string.h>
 
-// I2S out to MAX98357 via the DMA driver in third_party/i2s, fed by minigb_apu.
-// The LED uses pio0/sm0, so I2S lives on pio1. Volume is applied in software as a
-// linear 0-100% scale (settings.volume) -- a true mute at 0, full scale at 100 --
-// so the driver's own shift-volume is left at 0 (straight copy).
+// Shared I2S output to MAX98357 via the DMA driver in third_party/i2s.
+// GB/minigb_apu, NES, Atari, SMS and Game Gear all feed this layer. The LED uses
+// pio0/sm0, so I2S lives on pio1. User Volume is applied in software as a 0-100%
+// gain (with any core-specific headroom/mixing applied in that core's path), so
+// the driver's own shift-volume remains 0 / straight copy.
 
 static i2s_config_t s_cfg;
 static bool s_inited = false;
@@ -24,6 +25,45 @@ static bool s_inited = false;
 // One emulator runs at a time. Put the common stereo PCM staging buffer in
 // the 3 KiB tail reserved by arena.h instead of permanently charging .bss.
 static int16_t *s_pcmbuf = NULL;
+
+// Last time spent waiting inside i2s_dma_write(). A long wait means the emulator
+// produced audio early; a near-zero wait means it is close to consuming the
+// whole real-time audio period. Auto frame skip uses this as a lightweight
+// headroom signal without enabling profiling or CDC debugging.
+static uint32_t s_dma_wait_us = UINT32_MAX;
+
+static inline void audio_dma_wait_reset(void) {
+    s_dma_wait_us = UINT32_MAX;
+}
+
+static inline void audio_dma_write(void) {
+    uint32_t t0 = time_us_32();
+    i2s_dma_write(&s_cfg, s_pcmbuf);
+    s_dma_wait_us = time_us_32() - t0;
+}
+
+uint32_t snd_dma_wait_us(void) {
+    return s_dma_wait_us;
+}
+
+/*
+ * Runtime volume is 0..100%. Convert that percentage once per frame/open into
+ * Q10, then hot sample loops become multiply + shift instead of divide-by-100.
+ *
+ * Q10 keeps the gain error below ~0.05 percentage point while keeping the
+ * intermediate comfortably inside signed 32-bit for PicoBoy's current audio
+ * ranges. 100% maps exactly to 1024, so full-volume output is bit-identical.
+ */
+#define VOL_GAIN_SHIFT 10u
+#define VOL_GAIN_ONE   (1u << VOL_GAIN_SHIFT)
+
+static inline uint16_t volume_gain_q10(uint8_t vol) {
+    return (uint16_t)(((uint32_t)vol * VOL_GAIN_ONE + 50u) / 100u);
+}
+
+static inline int32_t volume_apply_q10(int32_t sample, uint16_t gain_q10) {
+    return (sample * (int32_t)gain_q10) >> VOL_GAIN_SHIFT;
+}
 
 void snd_init(void) {
     if (s_inited) return;
@@ -42,6 +82,7 @@ void snd_init(void) {
 
 void snd_apu_reset(void) {
     snd_init();
+    audio_dma_wait_reset();
     audio_init();                                 // minigb_apu: reset channel state
 }
 
@@ -54,15 +95,18 @@ bool snd_play_frame(void) {
 
     audio_callback(NULL, s_pcmbuf, AUDIO_BUFFER_SIZE_BYTES);
 
-    uint8_t vol = g_settings.volume;              // 0..100 (%)
+    const uint8_t vol = g_settings.volume;         // 0..100 (%)
     if (vol == 0) {
-        memset(s_pcmbuf, 0, SND_FRAMES * 2u * sizeof(*s_pcmbuf));               // mute -- DMA still runs to keep I2S clocked
+        memset(s_pcmbuf, 0, SND_FRAMES * 2u * sizeof(*s_pcmbuf)); // mute -- DMA still runs
     } else {
+        const uint16_t gain_q10 = volume_gain_q10(vol);
+
         // minigb_apu output is hot. GB_AUDIO_HEADROOM is the attenuation shift that
         // rides under the 0-100% Volume setting: 2 = Pico-GB quiet default (-12 dB),
         // 1 = ~2x louder (-6 dB), 0 = full scale (loudest; peaks may sound harsh).
         for (unsigned i = 0; i < SND_FRAMES * 2; i++) {
-            int32_t v = (((int32_t)s_pcmbuf[i] * vol) / 100) >> GB_AUDIO_HEADROOM;
+            int32_t v = volume_apply_q10((int32_t)s_pcmbuf[i], gain_q10)
+                        >> GB_AUDIO_HEADROOM;
             if (v >  32767) v =  32767;           // safety clamp (also covers future boost)
             if (v < -32768) v = -32768;
             s_pcmbuf[i] = (int16_t)v;
@@ -70,7 +114,7 @@ bool snd_play_frame(void) {
     }
 
     s_cfg.dma_trans_count = AUDIO_SAMPLES;        // GB count (NES may have changed it)
-    i2s_dma_write(&s_cfg, s_pcmbuf);   // waits for the previous buffer to finish draining,
+    audio_dma_write();   // waits for the previous buffer to finish draining,
     return true;                  // so this call paces the loop to the exact 44100 Hz rate
 }
 
@@ -121,6 +165,7 @@ static unsigned s_nesfill = 0;                 // stereo frames accumulated
 
 void snd_nes_open(void) {
     snd_init();                       // shared I2S up (idempotent)
+    audio_dma_wait_reset();
     s_nesfill = 0;
     s_nes_px = s_nes_hp = 0;          // reset the DC blocker for the new game
 }
@@ -183,7 +228,7 @@ void snd_nes_output(int n, const uint8_t *w1, const uint8_t *w2, const uint8_t *
 void snd_nes_flush(void) {
     if (!s_inited || s_nesfill == 0) return;
     s_cfg.dma_trans_count = s_nesfill;            // this frame's exact sample count
-    i2s_dma_write(&s_cfg, s_pcmbuf);              // blocks on prior DMA -> paces
+    audio_dma_write();              // blocks on prior DMA -> paces
     s_nesfill = 0;
 }
 
@@ -201,6 +246,7 @@ static bool     s_atari_block_queued = false;
 static bool     s_atari_filter_seeded = false;
 static int      s_atari_px = 0;
 static int      s_atari_hp = 0;
+static uint16_t s_atari_gain_q10 = VOL_GAIN_ONE;
 
 // Continuous DMA blocks: ~11.6 ms at 44.1 kHz.  The previous 256-sample
 // block doubled the number of DMA hand-offs while the emulator was still just
@@ -213,18 +259,22 @@ static void atari_write_block(void) {
         return;
 
     s_cfg.dma_trans_count = s_atari_fill;
-    i2s_dma_write(&s_cfg, s_pcmbuf);
+    audio_dma_write();
     s_atari_fill = 0;
     s_atari_block_queued = true;
 }
 
 void snd_atari_open(void) {
     snd_init();
+    audio_dma_wait_reset();
     s_atari_fill = 0;
     s_atari_block_queued = false;
     s_atari_filter_seeded = false;
     s_atari_px = 0;
     s_atari_hp = 0;
+    // Atari's overlay closes/reopens audio when settings change, so this gain
+    // remains valid for the entire active gameplay interval.
+    s_atari_gain_q10 = volume_gain_q10(g_settings.volume);
 }
 
 void snd_atari_sample(uint16_t level) {
@@ -258,9 +308,8 @@ void snd_atari_sample(uint16_t level) {
     }
 
     int sample = 0;
-    const uint8_t vol = g_settings.volume;
-    if (vol) {
-        int v = (hp * (int)vol) / 100;
+    if (s_atari_gain_q10) {
+        int v = (int)volume_apply_q10(hp, s_atari_gain_q10);
 
         // Final integer-range safety only; there is no normal-path compressor
         // or makeup stage.
@@ -309,6 +358,7 @@ static int  s_sms_hp = 0;
 
 void snd_sms_open(void) {
     snd_init();
+    audio_dma_wait_reset();
     s_sms_filter_seeded = false;
     s_sms_px = 0;
     s_sms_hp = 0;
@@ -322,6 +372,7 @@ bool snd_sms_frame(const int16_t *left, const int16_t *right, int n) {
         n = (int)SND_FRAMES;
 
     const uint8_t vol = g_settings.volume;
+    const uint16_t gain_q10 = volume_gain_q10(vol);
 
     for (int i = 0; i < n; i++) {
         int raw = ((int)left[i] + (int)right[i]) / 2;
@@ -340,7 +391,7 @@ bool snd_sms_frame(const int16_t *left, const int16_t *right, int n) {
             s_sms_hp = hp;
         }
 
-        int v = vol ? (hp * (int)vol) / 100 : 0;
+        int v = vol ? (int)volume_apply_q10(hp, gain_q10) : 0;
         if (v > 32767) v = 32767;
         if (v < -32768) v = -32768;
 
@@ -349,7 +400,7 @@ bool snd_sms_frame(const int16_t *left, const int16_t *right, int n) {
     }
 
     s_cfg.dma_trans_count = (uint32_t)n;
-    i2s_dma_write(&s_cfg, s_pcmbuf);  // waits for previous DMA: audio is master clock
+    audio_dma_write();  // waits for previous DMA: audio is master clock
     return true;
 }
 

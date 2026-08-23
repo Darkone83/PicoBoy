@@ -9,142 +9,587 @@
 #include "audio.h"
 #include "settings.h"
 #include "arena.h"
+#include "adaptive_frameskip.h"
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include <string.h>
 #include <stdio.h>
-#include "ff.h"            // .srm cart-RAM saves
+#include "ff.h"            // .srm cart-RAM saves + split-ROM CLMT
+#include "sd.h"            // direct raw-sector fills for SD-backed GBC
 
 #include "minigb_apu.h"  // declares audio_read/audio_write/audio_callback/audio_init
+
+// PicoBoy presents cartridge ROM to Peanut-GB as two direct 16 KiB windows.
+// Bank 0 always points at staged XIP flash. The switchable 0x4000-0x7FFF
+// window points either into XIP or at one of the two SRAM-backed SD cache banks.
+// Mapper writes only mark the window dirty; the first actual ROM read after the
+// write resolves the final bank once, avoiding duplicate loads on MBC5 low/high
+// bank-register sequences.
+struct gb_s;
+static const uint8_t *g_rom = NULL;
+static const uint8_t *s_romx_window = NULL;
+static bool s_romx_dirty = true;
+static uint8_t __not_in_flash_func(pb_romx_miss)(struct gb_s *g, uint_fast16_t addr);
+
+#define PEANUT_GB_DIRECT_ROM0_READ(g_, addr_) \
+    (g_rom[(uint16_t)(addr_)])
+#define PEANUT_GB_DIRECT_ROMX_READ(g_, addr_) \
+    ((s_romx_dirty || !s_romx_window) \
+        ? pb_romx_miss((g_), (uint_fast16_t)(addr_)) \
+        : s_romx_window[(uint16_t)(addr_) - 0x4000u])
+#define PEANUT_GB_ROM_BANK_CHANGED(g_) do { \
+    (void)(g_); \
+    s_romx_dirty = true; \
+} while (0)
+
 #define ENABLE_SOUND 1   // route GB sound-register access to minigb_apu
+#define PEANUT_FULL_GBC_SUPPORT 1
 #include "peanut_gb.h"   // single-header core; included in exactly this one TU
+#ifndef PEANUT_GB_CGB_FIXPALETTE_RGB565
+#error "PicoBoy GBC performance patch requires the RGB565 fixPalette peanut_gb.h patch"
+#endif
 #include "gbcolors.h"    // GBC-bootstrap preset palettes + per-game auto-assignment
 
-// Dual-core. core0 runs the emulator + input, core1 blits the frame to
-// the panel. Double-buffered ping-pong over the inter-core FIFO: core0 fills one
-// framebuffer while core1 pushes the other, so emulation overlaps the (SPI-bound)
-// blit instead of running after it.
+// GB/GBC uses the same one-hot PicoBoy core slot. The CGB-capable Peanut-GB
+// context, cart RAM, video ring, and optional SD ROM-bank cache all live in the
+// shared arena only while this core is active.
+//
+// Core0 runs emulation and converts each completed 160-pixel scanline to packed
+// RGB565. Core1 expands the small native-row ring to the existing 266x240
+// presentation and owns the ST7789 SPI transactions.
 
 #define GB_W 160
 #define GB_H 144
-// Fit-to-height, aspect-preserved: 160x144 -> 266x240, pillarboxed (~27px bars).
-#define GB_DST_H LCD_H                      // 240
+
+// Fit-to-height, aspect-preserved: 160x144 -> 266x240, pillarboxed.
+#define GB_DST_H LCD_H
 #define GB_DST_W (GB_W * LCD_H / GB_H)      // 266
 #define GB_DST_X ((LCD_W - GB_DST_W) / 2)   // 27
 #define GB_DST_Y 0
 
-// Native GB frame rate: 4194304 Hz / 70224 cycles = 59.7275 Hz -> 16742 us period.
-// Pace the emulation loop to this so the game runs at correct speed regardless of
-// how fast the blit finishes. (When 2c audio lands, the I2S drain becomes the real
-// clock and this pacer becomes a fallback.)
-#define GB_FRAME_US 16742
+#define GB_FRAME_US 16742u
 
-#define CART_RAM_BYTES (32u * 1024u)         // max GB cart RAM
-static struct gb_s gb;
-static uint8_t  *cart_ram;                    // -> arena (SML uses none)
-static uint16_t (*fb)[GB_W * GB_H];           // -> arena: double buffer (2 * ~45 KB)
-static uint16_t *g_draw_fb;                   // buffer the emulator draws into now
-static const uint8_t *g_rom;                 // -> XIP ROM window (flash.h ROM_FLASH_OFFSET)
+#define CART_RAM_BYTES      (32u * 1024u)
+#define GB_RING              8u
+#define GB_ROW_BYTES         (GB_W * 2u)
+#define GB_ROM_BANK_BYTES    0x4000u
+// Experimental mapped-bank backend: preserve the same 32 KiB cache budget as
+// two complete cartridge banks. Peanut-GB sees a direct 16 KiB memory window
+// after a bank is selected, so ordinary opcode/data fetches never walk the LRU.
+#define GB_SD_CACHE_BANK_BYTES GB_ROM_BANK_BYTES
+#define GB_SD_CACHE_BANKS      2u
+#define GB_ROM_PATH_MAX      128u
+#define GB_FASTSEEK_CLMT_DWORDS 16u
 
-static char g_save_path[96];                 // .srm path, or "" to disable saves
+static struct gb_s *gb = NULL;
+static uint8_t *cart_ram = NULL;
+static uint8_t *s_ring = NULL;
+
+
+// Loader-supplied ROM geometry. Small GB/GBC images are all-XIP.
+// A large .gbc uses a complete-bank-aligned XIP prefix and keeps only the tail
+// on SD. Peanut-GB still sees one linear ROM address space.
+static uint32_t s_rom_size = 0;
+static uint32_t s_flash_prefix = 0;
+static char s_rom_path[GB_ROM_PATH_MAX] = {0};
+
+typedef struct {
+    uint32_t base;
+    uint32_t stamp;
+    bool valid;
+    uint8_t *data;
+} gb_rom_cache_t;
+
+static gb_rom_cache_t s_cache[GB_SD_CACHE_BANKS];
+static uint32_t s_cache_stamp = 1;
+
+static FIL s_rom_file;
+static DWORD *s_rom_clmt = NULL;
+static bool s_rom_file_open = false;
+static bool s_rom_io_failed = false;
+
+static char g_save_path[96];
+static char g_state_path[96];
+static size_t g_save_size;
+
 void gb_set_save_path(const char *path) {
-    if (path) { strncpy(g_save_path, path, sizeof g_save_path - 1); g_save_path[sizeof g_save_path - 1] = '\0'; }
-    else g_save_path[0] = '\0';
+    if (!path) path = "";
+    snprintf(g_save_path, sizeof g_save_path, "%s", path);
 }
 
-static char g_state_path[96];                // .dat save-state path, or "" to disable
 void gb_set_state_path(const char *path) {
-    if (path) { strncpy(g_state_path, path, sizeof g_state_path - 1); g_state_path[sizeof g_state_path - 1] = '\0'; }
-    else g_state_path[0] = '\0';
+    if (!path) path = "";
+    snprintf(g_state_path, sizeof g_state_path, "%s", path);
 }
 
-static size_t g_save_size;                   // cart-RAM size (from ROM header, capped); set in gb_core_run
+void gb_set_rom_source(uint32_t total_size,
+                       uint32_t flash_prefix,
+                       const char *sd_path) {
+    s_rom_size = total_size;
+    s_flash_prefix = flash_prefix;
 
-// Active colour LUT: [3 source layers: OBJ0/OBJ1/BG][4 shades]. Filled by
-// apply_palette() from gbcolors.h -- either auto-assigned per game (settings
-// palette 0) or a manual preset (1..13). Each GB pixel carries its source layer
-// in LCD_PALETTE_ALL and its shade in LCD_COLOUR.
+    if (!sd_path) sd_path = "";
+    snprintf(s_rom_path, sizeof s_rom_path, "%s", sd_path);
+}
+
+// DMG palette LUT. CGB games ignore this and use the hardware palettes produced
+// by the CGB Peanut branch.
 static palette_t g_palette;
 
-// Refill g_palette from the current Volume/Palette setting. Auto (0) hashes the
-// loaded ROM for GBC-bootstrap colour; 1..13 select a fixed preset.
 static void apply_palette(void) {
+    if (!gb || gb->cgb.cgbMode)
+        return;
+
     if (g_settings.palette == 0) {
         char title[16];
-        auto_assign_palette(g_palette, gb_colour_hash(&gb), gb_get_rom_name(&gb, title));
+        auto_assign_palette(g_palette, gb_colour_hash(gb), gb_get_rom_name(gb, title));
     } else {
         manual_assign_palette(g_palette, (uint8_t)(g_settings.palette - 1));
     }
 }
 
-// ---- Peanut-GB callbacks ----
-static uint8_t rom_read(struct gb_s *g, const uint_fast32_t addr) {
-    (void)g; return g_rom[addr];
-}
-static uint8_t ram_read(struct gb_s *g, const uint_fast32_t addr) {
-    (void)g; return cart_ram[addr];
-}
-static void ram_write(struct gb_s *g, const uint_fast32_t addr, const uint8_t val) {
-    (void)g; cart_ram[addr] = val;
-}
-static void gb_err(struct gb_s *g, const enum gb_error_e err, const uint16_t addr) {
-    (void)g; (void)err; (void)addr;   // non-fatal; keep running
-}
-static void draw_line(struct gb_s *g, const uint8_t *pixels, const uint_fast8_t line) {
-    (void)g;
-    uint16_t *row = &g_draw_fb[(uint32_t)line * GB_W];
-    for (int x = 0; x < GB_W; x++)
-        row[x] = g_palette[(pixels[x] & LCD_PALETTE_ALL) >> 4][pixels[x] & LCD_COLOUR];
+// Auto frame skip state. Skipped frames keep machine/audio timing but suppress
+// PicoBoy's scanline conversion and display work.
+static adaptive_frameskip_t s_auto_fs;
+static bool g_capture_frame = true;
+
+// ---------------------------------------------------------------------------
+// Arena
+// ---------------------------------------------------------------------------
+
+static uint8_t *s_ap = NULL;
+static uint8_t *s_ae = NULL;
+
+static void gb_arena_reset(void) {
+    s_ap = arena_base();
+    s_ae = arena_base() + ARENA_WORK_BYTES;
 }
 
-// Interlace: on the breadboard the SPI can't push the full upscaled frame in one
-// GB period, so we refresh alternating destination rows each frame (~half the SPI
-// traffic). Set false for progressive (zero shimmer) once the PCB's faster SPI can
-// afford the full frame. 2e's overlay can flip this at runtime.
-volatile bool g_gb_interlace = true;
+static void *gb_arena_alloc(size_t n) {
+    uintptr_t p = ((uintptr_t)s_ap + 3u) & ~(uintptr_t)3u;
+    uint8_t *q = (uint8_t *)p;
 
-// Set by core0 when it hands core1 a frame; cleared by core1 when the blit is done.
-// core0 polls this and only hands over a new frame when core1 is idle -- so a slow
-// blit drops video frames instead of stalling core0 (which would starve the audio).
-static volatile bool g_core1_busy = false;
+    if (!s_ap || !s_ae || q > s_ae || (size_t)(s_ae - q) < n)
+        return NULL;
 
-// Core1: dedicated display. Blocks for a buffer index from core0, blits it, then
-// clears the busy flag. Owns SPI0 during gameplay (core0 doesn't touch the panel).
-static void core1_display(void) {
-    int field = 0;
-    while (true) {
-        uint32_t idx = multicore_fifo_pop_blocking();
-        if (g_gb_interlace) {
-            st7789_blit_scaled_field(GB_DST_X, GB_DST_Y, GB_DST_W, GB_DST_H,
-                                     fb[idx], GB_W, GB_H, field);
-            field ^= 1;                      // alternate even/odd rows each frame
-        } else {
-            st7789_blit_scaled(GB_DST_X, GB_DST_Y, GB_DST_W, GB_DST_H,
-                               fb[idx], GB_W, GB_H);
-        }
-        g_core1_busy = false;                // done -- core0 may hand over the next frame
+    s_ap = q + n;
+    return q;
+}
+
+// ---------------------------------------------------------------------------
+// Split-ROM cache
+// ---------------------------------------------------------------------------
+
+static void rom_cache_reset(void) {
+    s_cache_stamp = 1;
+    s_romx_window = NULL;
+    s_romx_dirty = true;
+
+    for (unsigned i = 0; i < GB_SD_CACHE_BANKS; i++) {
+        s_cache[i].base = 0;
+        s_cache[i].stamp = 0;
+        s_cache[i].valid = false;
     }
+    s_rom_io_failed = false;
+}
+
+static bool rom_open_tail(void) {
+    if (s_flash_prefix >= s_rom_size)
+        return true;                    // all-XIP
+
+    if (!s_rom_path[0])
+        return false;
+
+    if (f_open(&s_rom_file, s_rom_path, FA_READ) != FR_OK)
+        return false;
+
+    s_rom_file_open = true;
+
+#if FF_USE_FASTSEEK
+    // Build a compact cluster-link map for the SD-backed ROM. Sixteen DWORDs
+    // cover up to seven contiguous fragments. FastSeek is an optimization only:
+    // if the file is more fragmented (or CLMT creation otherwise fails), clear
+    // cltbl so FatFs transparently falls back to its normal FAT-chain seek path.
+    if (s_rom_clmt) {
+        s_rom_clmt[0] = GB_FASTSEEK_CLMT_DWORDS;
+        s_rom_file.cltbl = s_rom_clmt;
+
+        if (f_lseek(&s_rom_file, CREATE_LINKMAP) != FR_OK)
+            s_rom_file.cltbl = NULL;
+    }
+#endif
+
+    return true;
+}
+
+static void rom_close_tail(void) {
+    if (s_rom_file_open) {
+        f_close(&s_rom_file);
+        s_rom_file_open = false;
+    }
+}
+
+// Translate an aligned file offset through FatFs' CLMT into one or more
+// physically contiguous SD runs and read those runs directly with CMD18.
+//
+// This deliberately depends only on public FIL/FATFS fields already exposed by
+// the bundled FatFs configuration. If FastSeek is unavailable, the CLMT could
+// not be built, the request is not sector aligned, or the map looks invalid,
+// return false and let the normal FatFs path handle the refill.
+static bool rom_raw_read_clmt(uint32_t file_off, uint8_t *dst, uint32_t bytes) {
+#if FF_USE_FASTSEEK
+    if (!s_rom_file_open || !s_rom_file.cltbl || !dst || bytes == 0)
+        return false;
+    if ((file_off & 511u) || (bytes & 511u))
+        return false;
+
+    FATFS *fs = s_rom_file.obj.fs;
+    if (!fs || fs->csize == 0 || fs->pdrv != 0)
+        return false;
+
+    uint32_t sector_ord = file_off >> 9;
+    uint32_t sectors_left = bytes >> 9;
+    uint8_t *out = dst;
+
+    while (sectors_left) {
+        uint32_t cluster_ord = sector_ord / (uint32_t)fs->csize;
+        uint32_t sector_in_cluster = sector_ord % (uint32_t)fs->csize;
+        uint32_t rel_cluster = cluster_ord;
+        DWORD *tbl = s_rom_file.cltbl + 1;
+        DWORD frag_clusters = 0;
+        DWORD frag_start = 0;
+
+        for (;;) {
+            frag_clusters = *tbl++;
+            if (frag_clusters == 0)
+                return false;
+            frag_start = *tbl++;
+            if (rel_cluster < frag_clusters)
+                break;
+            rel_cluster -= frag_clusters;
+        }
+
+        DWORD cl = frag_start + rel_cluster;
+        if (cl < 2)
+            return false;
+
+        uint64_t lba64 = (uint64_t)fs->database
+                       + (uint64_t)(cl - 2u) * (uint64_t)fs->csize
+                       + (uint64_t)sector_in_cluster;
+        if (lba64 > UINT32_MAX)
+            return false;
+
+        uint32_t contiguous = (uint32_t)(frag_clusters - rel_cluster)
+                            * (uint32_t)fs->csize
+                            - sector_in_cluster;
+        uint32_t take = sectors_left < contiguous ? sectors_left : contiguous;
+        if (take == 0)
+            return false;
+
+        if (!sd_read_blocks(out, (uint32_t)lba64, take))
+            return false;
+
+        out += (size_t)take * 512u;
+        sector_ord += take;
+        sectors_left -= take;
+    }
+
+    return true;
+#else
+    (void)file_off;
+    (void)dst;
+    (void)bytes;
+    return false;
+#endif
+}
+
+static uint8_t *rom_cache_bank(uint32_t bank_base) {
+    for (unsigned i = 0; i < GB_SD_CACHE_BANKS; i++) {
+        if (s_cache[i].valid && s_cache[i].base == bank_base) {
+            s_cache[i].stamp = s_cache_stamp++;
+            return s_cache[i].data;
+        }
+    }
+
+
+    // Generic LRU: use an empty slot first, otherwise evict the oldest bank.
+    unsigned victim = 0;
+    uint32_t oldest = UINT32_MAX;
+    for (unsigned i = 0; i < GB_SD_CACHE_BANKS; i++) {
+        if (!s_cache[i].valid) {
+            victim = i;
+            oldest = 0;
+            break;
+        }
+        if (s_cache[i].stamp < oldest) {
+            oldest = s_cache[i].stamp;
+            victim = i;
+        }
+    }
+
+    gb_rom_cache_t *c = &s_cache[victim];
+
+    if (!s_rom_file_open) {
+        s_rom_io_failed = true;
+        return NULL;
+    }
+
+    uint32_t remain = (bank_base < s_rom_size) ? (s_rom_size - bank_base) : 0u;
+    UINT want = (UINT)(remain < GB_SD_CACHE_BANK_BYTES ? remain : GB_SD_CACHE_BANK_BYTES);
+    if (want == 0) {
+        s_rom_io_failed = true;
+        return NULL;
+    }
+
+    bool filled = false;
+
+    // Fastest path: the ROM is sector-aligned and CLMT creation succeeded, so
+    // bypass FatFs' per-cluster read loop and issue raw multi-sector reads across
+    // each physically-contiguous extent. For an ordinary contiguous 16 KiB bank
+    // this is one CMD18 carrying 32 sectors.
+    if ((want & 511u) == 0 && rom_raw_read_clmt(bank_base, c->data, want)) {
+        filled = true;
+    }
+
+    // Compatibility fallback: fragmented CLMT too large, unexpected geometry,
+    // raw transfer failure, or a short final non-sector-aligned bank. FastSeek
+    // remains active here when its CLMT is available.
+    if (!filled) {
+        if (s_rom_file.fptr != (FSIZE_t)bank_base &&
+            f_lseek(&s_rom_file, (FSIZE_t)bank_base) != FR_OK) {
+            s_rom_io_failed = true;
+            return NULL;
+        }
+
+        UINT br = 0;
+        if (f_read(&s_rom_file, c->data, want, &br) != FR_OK || br != want) {
+            s_rom_io_failed = true;
+            return NULL;
+        }
+    }
+
+    if (want < GB_SD_CACHE_BANK_BYTES)
+        memset(c->data + want, 0xFF, GB_SD_CACHE_BANK_BYTES - want);
+
+    c->base = bank_base;
+    c->stamp = s_cache_stamp++;
+    c->valid = true;
+    return c->data;
+}
+
+// ---------------------------------------------------------------------------
+// Peanut-GB callbacks
+// ---------------------------------------------------------------------------
+
+// Normal GB and all-flash GBC use the same minimal callback shape as the
+// original PicoBoy GB core. Once gb_init() has validated the cartridge header,
+// Peanut's mapper supplies the ROM address and XIP is indexed directly.
+static uint8_t __not_in_flash_func(rom_read_xip)(struct gb_s *g, const uint_fast32_t addr) {
+    (void)g;
+    return g_rom[(uint32_t)addr];
+}
+
+// Resolve the switchable 0x4000-0x7FFF cartridge window only when the mapper
+// changes it. Hot ROM reads then become one pointer dereference inside
+// PEANUT_GB_DIRECT_ROMX_READ instead of a callback + address/cache lookup.
+static uint8_t __not_in_flash_func(pb_romx_miss)(struct gb_s *g, uint_fast16_t addr) {
+    uint16_t bank;
+
+    // Match Peanut-GB's existing MBC1 mode-1 mapping semantics. All other
+    // supported MBCs use selected_rom_bank directly for the switchable window.
+    if (g->mbc == 1 && g->cart_mode_select)
+        bank = (uint16_t)(g->selected_rom_bank & 0x1Fu);
+    else
+        bank = (uint16_t)g->selected_rom_bank;
+
+    bank &= g->num_rom_banks_mask;
+    uint32_t bank_base = (uint32_t)bank * GB_ROM_BANK_BYTES;
+
+    if (bank_base >= s_rom_size) {
+        s_romx_window = NULL;
+        s_romx_dirty = false;
+        return 0xFF;
+    }
+
+    if (bank_base < s_flash_prefix) {
+        s_romx_window = g_rom + bank_base;
+    } else {
+        s_romx_window = rom_cache_bank(bank_base);
+        if (!s_romx_window) {
+            s_romx_dirty = true;
+            return 0xFF;
+        }
+    }
+
+    s_romx_dirty = false;
+    return s_romx_window[(uint16_t)addr - 0x4000u];
+}
+
+static uint8_t __not_in_flash_func(ram_read)(struct gb_s *g, const uint_fast32_t addr) {
+    (void)g;
+    if ((uint32_t)addr >= CART_RAM_BYTES)
+        return 0xFF;
+    return cart_ram[addr];
+}
+
+static void __not_in_flash_func(ram_write)(struct gb_s *g,
+                      const uint_fast32_t addr,
+                      const uint8_t val) {
+    (void)g;
+    if ((uint32_t)addr < CART_RAM_BYTES)
+        cart_ram[addr] = val;
+}
+
+static void gb_err(struct gb_s *g,
+                   const enum gb_error_e err,
+                   const uint16_t addr) {
+    (void)g;
+    (void)err;
+    (void)addr;
+}
+
+// ---------------------------------------------------------------------------
+// Native 160x144 row ring -> Core1 -> 266x240 ST7789
+// ---------------------------------------------------------------------------
+
+static volatile uint32_t s_wr = 0;
+static volatile uint32_t s_rd = 0;
+static volatile bool s_frame_done = false;
+static volatile bool s_core1_run = false;
+static volatile bool s_core1_idle = true;
+static volatile bool s_core1_started = false;
+static bool s_stream_this = false;
+
+static inline uint8_t *ring_row(uint32_t i) {
+    return s_ring + (i % GB_RING) * GB_ROW_BYTES;
+}
+
+static void __not_in_flash_func(draw_line)(struct gb_s *g,
+                                            const uint8_t *pixels,
+                                            const uint_fast8_t line) {
+    if (!g_capture_frame || !s_stream_this || !s_ring || line >= GB_H)
+        return;
+
+    while ((uint32_t)(s_wr - s_rd) >= GB_RING)
+        tight_loop_contents();
+
+    uint8_t *dst = ring_row(s_wr);
+
+    if (g->cgb.cgbMode) {
+        for (int x = 0; x < GB_W; x++) {
+            // Patched Peanut keeps fixPalette[] in PicoBoy-ready RGB565, so the
+            // hot scanline loop is now only palette lookup + byte packing.
+            uint16_t c = g->cgb.fixPalette[pixels[x] & 0x3Fu];
+            dst[x * 2]     = (uint8_t)(c >> 8);
+            dst[x * 2 + 1] = (uint8_t)c;
+        }
+    } else {
+        for (int x = 0; x < GB_W; x++) {
+            uint16_t c =
+                g_palette[(pixels[x] & LCD_PALETTE_ALL) >> 4]
+                         [pixels[x] & LCD_COLOUR];
+            dst[x * 2]     = (uint8_t)(c >> 8);
+            dst[x * 2 + 1] = (uint8_t)c;
+        }
+    }
+
+    __sync_synchronize();
+    s_wr++;
+}
+
+static void __not_in_flash_func(core1_display)(void) {
+    uint8_t xmap[GB_DST_W];
+    uint8_t row[GB_DST_W * 2];
+
+    // Same horizontal nearest-neighbour geometry as the previous GB path.
+    // Build the map once on Core1 rather than doing division in the hot row loop.
+    for (int x = 0; x < GB_DST_W; x++)
+        xmap[x] = (uint8_t)((x * GB_W) / GB_DST_W);
+
+    uint32_t send = 0;
+    int sy = 0;
+    int dy = 0;
+    int field = 0;
+
+    s_core1_idle = false;
+    __sync_synchronize();
+    s_core1_started = true;
+
+    while (s_core1_run) {
+        if (send != s_wr) {
+            const uint8_t *src = ring_row(send);
+
+            for (int x = 0; x < GB_DST_W; x++) {
+                int sx = xmap[x];
+                row[x * 2]     = src[sx * 2];
+                row[x * 2 + 1] = src[sx * 2 + 1];
+            }
+
+            // Source row is now copied into Core1-local scratch. Release the
+            // arena ring slot before touching SPI so Core0 can keep emulating.
+            send++;
+            __sync_synchronize();
+            s_rd = send;
+
+            // Preserve the known-good GB presentation model: update alternating
+            // destination rows each presented frame. The experimental scanline
+            // renderer originally pushed all 240 rows every frame, roughly
+            // doubling display traffic versus the stable GB core.
+            //
+            // 144 -> 240 nearest-neighbour still uses the same vertical mapping;
+            // only rows belonging to the current field are transferred.
+            while (dy < GB_DST_H && ((dy * GB_H) / GB_DST_H) == sy) {
+                if ((dy & 1) == field)
+                    st7789_stream_row_at(GB_DST_X, GB_DST_Y + dy,
+                                         row, GB_DST_W);
+                dy++;
+            }
+
+            sy++;
+
+        } else if (s_frame_done) {
+            __sync_synchronize();
+            s_rd = send;
+            s_frame_done = false;
+            sy = 0;
+            dy = 0;
+            field ^= 1;
+
+        } else {
+            tight_loop_contents();
+        }
+    }
+
+    s_rd = send;
+    s_core1_idle = true;
+}
+
+static void display_drain(void) {
+    while (s_frame_done || s_rd != s_wr)
+        tight_loop_contents();
 }
 
 static void poll_input(void) {
     uint16_t s = buttons_state();
-    uint8_t j = 0xFF;   // GB joypad is active-low
-    if (s & (1u << BTN_A))      j &= ~JOYPAD_A;
-    if (s & (1u << BTN_B))      j &= ~JOYPAD_B;
-    if (s & (1u << BTN_SELECT)) j &= ~JOYPAD_SELECT;
-    if (s & (1u << BTN_START))  j &= ~JOYPAD_START;
-    if (s & (1u << BTN_RIGHT))  j &= ~JOYPAD_RIGHT;
-    if (s & (1u << BTN_LEFT))   j &= ~JOYPAD_LEFT;
-    if (s & (1u << BTN_UP))     j &= ~JOYPAD_UP;
-    if (s & (1u << BTN_DOWN))   j &= ~JOYPAD_DOWN;
-    gb.direct.joypad = j;
+
+    // Peanut-GB's pinned CGB branch exposes the active-low joypad through
+    // direct.joypad_bits rather than the newer JOYPAD_* mask macros.
+    gb->direct.joypad = 0xFF;
+    if (s & (1u << BTN_A))      gb->direct.joypad_bits.a = 0;
+    if (s & (1u << BTN_B))      gb->direct.joypad_bits.b = 0;
+    if (s & (1u << BTN_SELECT)) gb->direct.joypad_bits.select = 0;
+    if (s & (1u << BTN_START))  gb->direct.joypad_bits.start = 0;
+    if (s & (1u << BTN_RIGHT))  gb->direct.joypad_bits.right = 0;
+    if (s & (1u << BTN_LEFT))   gb->direct.joypad_bits.left = 0;
+    if (s & (1u << BTN_UP))     gb->direct.joypad_bits.up = 0;
+    if (s & (1u << BTN_DOWN))   gb->direct.joypad_bits.down = 0;
 }
 
 static void show_error(const char *msg) {
     st7789_fill(g_theme->bg);
-    ui_header("Run GB");
+    ui_header("Run GB / GBC");
     st7789_draw_string(12, 90,  msg,                      g_theme->err,       g_theme->bg, 1);
-    st7789_draw_string(12, 110, "Flash a ROM .uf2 first", g_theme->footer_fg, g_theme->bg, 1);
+    st7789_draw_string(12, 110, "Browse ROMs from SD first", g_theme->footer_fg, g_theme->bg, 1);
     ui_footer("B back");
     led_set_count(2);              // blink code 2: no ROM staged
     led_set_state(LED_ERROR);
@@ -162,7 +607,7 @@ static void show_error(const char *msg) {
 // restore them after reading. State files are build-specific: the gb_size guard
 // rejects a snapshot from firmware with a different struct layout.
 #define STATE_MAGIC   0x54534250u   // 'PBST'
-#define STATE_VERSION 1u
+#define STATE_VERSION 2u
 
 typedef struct {
     uint32_t magic;
@@ -180,7 +625,7 @@ static bool save_state(void) {
                       (uint32_t)sizeof(struct gb_s), (uint32_t)g_save_size };
     UINT bw = 0;
     bool ok = (f_write(&f, &h, sizeof h, &bw) == FR_OK && bw == sizeof h);
-    ok = ok && (f_write(&f, &gb, sizeof gb, &bw) == FR_OK && bw == sizeof gb);
+    ok = ok && (f_write(&f, gb, sizeof *gb, &bw) == FR_OK && bw == sizeof *gb);
     if (ok && g_save_size)
         ok = ok && (f_write(&f, cart_ram, (UINT)g_save_size, &bw) == FR_OK);
     f_close(&f);
@@ -201,27 +646,36 @@ static bool load_state(void) {
     if (ok) {
         // Snapshot the live (valid) pointers before the read clobbers them.
         // __typeof__ keeps each local's type identical to the struct member.
-        __typeof__(gb.gb_rom_read)           p_rom  = gb.gb_rom_read;
-        __typeof__(gb.gb_cart_ram_read)      p_cr   = gb.gb_cart_ram_read;
-        __typeof__(gb.gb_cart_ram_write)     p_cw   = gb.gb_cart_ram_write;
-        __typeof__(gb.gb_error)              p_err  = gb.gb_error;
-        __typeof__(gb.gb_serial_tx)          p_stx  = gb.gb_serial_tx;
-        __typeof__(gb.gb_serial_rx)          p_srx  = gb.gb_serial_rx;
-        __typeof__(gb.gb_bootrom_read)       p_boot = gb.gb_bootrom_read;
-        __typeof__(gb.display.lcd_draw_line) p_ld   = gb.display.lcd_draw_line;
-        void                                *p_priv = gb.direct.priv;
+        __typeof__(gb->gb_rom_read)           p_rom  = gb->gb_rom_read;
+        __typeof__(gb->gb_cart_ram_read)      p_cr   = gb->gb_cart_ram_read;
+        __typeof__(gb->gb_cart_ram_write)     p_cw   = gb->gb_cart_ram_write;
+        __typeof__(gb->gb_error)              p_err  = gb->gb_error;
+        __typeof__(gb->gb_serial_tx)          p_stx  = gb->gb_serial_tx;
+        __typeof__(gb->gb_serial_rx)          p_srx  = gb->gb_serial_rx;
+        __typeof__(gb->gb_bootrom_read)       p_boot = gb->gb_bootrom_read;
+        __typeof__(gb->display.lcd_draw_line) p_ld   = gb->display.lcd_draw_line;
+        void                                *p_priv = gb->direct.priv;
 
-        ok = (f_read(&f, &gb, sizeof gb, &br) == FR_OK && br == sizeof gb);
+        ok = (f_read(&f, gb, sizeof *gb, &br) == FR_OK && br == sizeof *gb);
 
-        gb.gb_rom_read           = p_rom;
-        gb.gb_cart_ram_read      = p_cr;
-        gb.gb_cart_ram_write     = p_cw;
-        gb.gb_error              = p_err;
-        gb.gb_serial_tx          = p_stx;
-        gb.gb_serial_rx          = p_srx;
-        gb.gb_bootrom_read       = p_boot;
-        gb.display.lcd_draw_line = p_ld;
-        gb.direct.priv           = p_priv;
+        gb->gb_rom_read           = p_rom;
+        gb->gb_cart_ram_read      = p_cr;
+        gb->gb_cart_ram_write     = p_cw;
+        gb->gb_error              = p_err;
+        gb->gb_serial_tx          = p_stx;
+        gb->gb_serial_rx          = p_srx;
+        gb->gb_bootrom_read       = p_boot;
+        gb->display.lcd_draw_line = p_ld;
+        gb->direct.priv           = p_priv;
+
+        // Render suppression is a live frontend scheduling decision, not
+        // persistent emulated state. Never inherit it from a save-state blob.
+        gb->direct.skip_render    = 0;
+
+        // selected_rom_bank/cart_mode_select came from the snapshot. Resolve
+        // the cartridge window lazily on the first post-load ROM fetch.
+        s_romx_window = NULL;
+        s_romx_dirty = true;
 
         if (ok && h.ram_size) {
             UINT want = h.ram_size > CART_RAM_BYTES ? (UINT)CART_RAM_BYTES : (UINT)h.ram_size;
@@ -275,8 +729,14 @@ static int gb_overlay(void) {
                 switch (i) {
                     case 1: snprintf(val, sizeof val, "%u%%", g_settings.lcd_brightness); break;
                     case 2: snprintf(val, sizeof val, "%u%%", g_settings.volume);          break;
-                    case 3: if (g_settings.palette == 0) snprintf(val, sizeof val, "Auto");
-                            else snprintf(val, sizeof val, "P%u", g_settings.palette);      break;
+                    case 3:
+                            if (gb && gb->cgb.cgbMode)
+                                snprintf(val, sizeof val, "Hardware");
+                            else if (g_settings.palette == 0)
+                                snprintf(val, sizeof val, "Auto");
+                            else
+                                snprintf(val, sizeof val, "P%u", g_settings.palette);
+                            break;
                     case 4: if (g_settings.frameskip < 0) snprintf(val, sizeof val, "Auto");
                             else snprintf(val, sizeof val, "%d", g_settings.frameskip);     break;
                     default: break;
@@ -319,7 +779,11 @@ static int gb_overlay(void) {
                     g_settings.volume = (uint8_t)v;
                     dirty = true; redraw = true;
                 } break;
-                case 3: {   // Palette: 0=Auto, 1..13 presets (applies on resume)
+                case 3: {   // DMG palette; CGB games use hardware palettes.
+                    if (gb && gb->cgb.cgbMode) {
+                        redraw = true;
+                        break;
+                    }
                     int p = (int)g_settings.palette + d;
                     if (p < 0) p = 13; if (p > 13) p = 0;
                     g_settings.palette = (uint8_t)p;
@@ -371,28 +835,114 @@ done:
 }
 
 void gb_core_run(void) {
-    // Carve GB's big buffers from the shared arena (NES reuses the same region).
-    fb       = (uint16_t (*)[GB_W * GB_H])arena_base();
-    cart_ram = (uint8_t *)arena_base() + 2u * (GB_W * GB_H) * sizeof(uint16_t);
+    gb_arena_reset();
+
+    gb = (struct gb_s *)gb_arena_alloc(sizeof(struct gb_s));
+    cart_ram = (uint8_t *)gb_arena_alloc(CART_RAM_BYTES);
+    s_ring = (uint8_t *)gb_arena_alloc(GB_RING * GB_ROW_BYTES);
+
+    bool split = (s_rom_size != 0 && s_flash_prefix < s_rom_size);
+
+    for (unsigned i = 0; i < GB_SD_CACHE_BANKS; i++) {
+        s_cache[i].data = split
+                        ? (uint8_t *)gb_arena_alloc(GB_SD_CACHE_BANK_BYTES)
+                        : NULL;
+    }
+
+    // FastSeek CLMT is borrowed from the one-hot arena only for SD-backed GBC.
+    // 16 DWORDs = 64 bytes and describes up to seven file fragments. Allocation
+    // is deliberately optional; NULL simply leaves the normal FatFs seek path.
+    s_rom_clmt = split
+               ? (DWORD *)gb_arena_alloc(GB_FASTSEEK_CLMT_DWORDS * sizeof(DWORD))
+               : NULL;
+
+    if (!gb || !cart_ram || !s_ring ||
+        (split && (!s_cache[0].data || !s_cache[1].data))) {
+        show_error("Out of RAM (GB/GBC)");
+        return;
+    }
 
     g_rom = flash_ptr(ROM_FLASH_OFFSET);
 
-    enum gb_init_error_e e = gb_init(&gb, rom_read, ram_read, ram_write, gb_err, NULL);
+    // Backward-compatible fallback for an old all-flash GB launch that did not
+    // pass explicit geometry. The header's ROM-size code is available in the
+    // guaranteed staged first bank.
+    if (s_rom_size == 0) {
+        static const uint32_t normal_sizes[] = {
+            32u*1024u, 64u*1024u, 128u*1024u, 256u*1024u,
+            512u*1024u, 1024u*1024u, 2048u*1024u, 4096u*1024u,
+            8192u*1024u
+        };
+        uint8_t code = g_rom[0x148];
+        if (code <= 8) {
+            s_rom_size = normal_sizes[code];
+        } else if (code == 0x52) {
+            s_rom_size = 72u * GB_ROM_BANK_BYTES;
+        } else if (code == 0x53) {
+            s_rom_size = 80u * GB_ROM_BANK_BYTES;
+        } else if (code == 0x54) {
+            s_rom_size = 96u * GB_ROM_BANK_BYTES;
+        }
+        s_flash_prefix = s_rom_size;
+        split = false;
+    }
+
+    if (s_rom_size == 0 || s_flash_prefix == 0 ||
+        s_flash_prefix > s_rom_size) {
+        show_error("Bad ROM geometry");
+        return;
+    }
+
+    // A split prefix must end at a complete 16-KiB cartridge bank so every
+    // mapped bank is wholly XIP or wholly cached from SD.
+    if (split && (s_flash_prefix & (GB_ROM_BANK_BYTES - 1u))) {
+        show_error("Split ROM not bank aligned");
+        return;
+    }
+
+    memset(gb, 0, sizeof *gb);
+    memset(cart_ram, 0, CART_RAM_BYTES);
+    memset(s_ring, 0, GB_RING * GB_ROW_BYTES);
+    rom_cache_reset();
+
+    if (split) {
+        if (!rom_open_tail()) {
+            rom_close_tail();
+            show_error("SD ROM tail unavailable");
+            return;
+        }
+        // Do not preload an arbitrary tail bank. The mapper-driven ROMX window
+        // will demand-fill the first bank actually selected by the game.
+        s_rom_io_failed = false;
+    }
+
+    // The generic ROM callback is now only needed by Peanut-GB's cartridge
+    // header/title helpers, all of which live in guaranteed staged bank 0. CPU
+    // ROM reads use the direct ROM0/ROMX windows patched into peanut_gb.h.
+    enum gb_init_error_e e =
+        gb_init(gb, rom_read_xip, ram_read, ram_write, gb_err, NULL);
+
     if (e != GB_INIT_NO_ERROR) {
-        show_error(e == GB_INIT_INVALID_CHECKSUM ? "No / bad ROM in flash"
+        rom_close_tail();
+        show_error(e == GB_INIT_INVALID_CHECKSUM ? "No / bad GB ROM"
                                                  : "Unsupported cartridge");
         return;
     }
 
-    memset(cart_ram, 0, CART_RAM_BYTES);    // fresh RAM; .srm (if any) is overlaid below
-    gb_init_lcd(&gb, draw_line);
-    apply_palette();                         // auto-assign by game hash, or the chosen preset
+    gb_init_lcd(gb, draw_line);
+    apply_palette();
 
-    // Cart-RAM battery save: size comes from the ROM header (capped to our buffer).
-    // Load the .srm into cart RAM if one exists; written back when the game exits.
     g_save_size = 0;
-    gb_get_save_size_s(&gb, &g_save_size);
-    if (g_save_size > CART_RAM_BYTES) g_save_size = CART_RAM_BYTES;
+    g_save_size = (size_t)gb_get_save_size(gb);
+
+    // Keep the first GBC experiment fail-closed for large cartridge RAM rather
+    // than allowing Peanut's callback to walk beyond the arena allocation.
+    if (g_save_size > CART_RAM_BYTES) {
+        rom_close_tail();
+        show_error("Cart RAM >32K unsupported");
+        return;
+    }
+
     if (g_save_size > 0 && g_save_path[0]) {
         FIL f;
         if (f_open(&f, g_save_path, FA_READ) == FR_OK) {
@@ -402,94 +952,136 @@ void gb_core_run(void) {
         }
     }
 
-    snd_apu_reset();                         // bring up I2S (idempotent) + reset the APU
-    st7789_fill(COL_BLACK);                  // pillarbox bars stay black
+    snd_apu_reset();
+    adaptive_frameskip_reset(&s_auto_fs);
+    g_capture_frame = true;
+    gb->direct.skip_render = 0;
 
-    // Prime: render frame 0 and do ONE full progressive blit on core0, so the
-    // screen starts complete. (In interlace mode the per-field passes only refresh
-    // half the rows; without this the first frame would show half black.) core1
-    // isn't launched yet, so there's no SPI contention here.
-    int draw_buf = 0;
-    g_draw_fb = fb[0];
-    poll_input();
-    gb_run_frame(&gb);
-    st7789_blit_scaled(GB_DST_X, GB_DST_Y, GB_DST_W, GB_DST_H, fb[0], GB_W, GB_H);
+    s_wr = s_rd = 0;
+    s_frame_done = false;
+    s_stream_this = false;
+    s_core1_run = true;
+    s_core1_idle = false;
+    s_core1_started = false;
 
+    st7789_fill(COL_BLACK);
     multicore_launch_core1(core1_display);
-    g_core1_busy = true;
-    multicore_fifo_push_blocking(0);         // hand fb[0] to core1; it will draw fb[0]
-    draw_buf = 1;                            // emulate the next frame into the other buffer
+
+    absolute_time_t start_deadline = make_timeout_time_ms(100);
+    while (!s_core1_started && !time_reached(start_deadline))
+        tight_loop_contents();
+
+    if (!s_core1_started) {
+        s_core1_run = false;
+        multicore_reset_core1();
+        rom_close_tail();
+        show_error("Display core failed");
+        return;
+    }
 
     bool quit = false;
     uint32_t frame_count = 0;
     absolute_time_t next_frame = make_timeout_time_us(GB_FRAME_US);
+
     while (!quit) {
         buttons_update();
+
         if (buttons_pressed() & (1u << BTN_MENU)) {
-            // Pause. Let core1 finish any in-flight blit, then it parks in its
-            // FIFO wait (not touching SPI) while core0 drives the overlay.
-            while (g_core1_busy) tight_loop_contents();
+            display_drain();
             led_set_state(LED_IDLE);
+
             int r = gb_overlay();
-            if (r == 1) { quit = true; break; }      // Quit selected
-            // Resume: emulate one fresh frame, clear the whole screen (so overlay
-            // text in the pillarbox bars is flushed -- the blit only covers the
-            // 266-wide game area), then full progressive blit and restart the pipeline.
+
+            if (r == 1) {
+                quit = true;
+                break;
+            }
+
             led_set_state(LED_RUNNING);
-            g_draw_fb = fb[0];
-            poll_input();
-            gb_run_frame(&gb);
+            adaptive_frameskip_reset(&s_auto_fs);
+            gb->direct.skip_render = 0;
             st7789_fill(COL_BLACK);
-            st7789_blit_scaled(GB_DST_X, GB_DST_Y, GB_DST_W, GB_DST_H, fb[0], GB_W, GB_H);
-            draw_buf = 1;
+            buttons_update();
             next_frame = make_timeout_time_us(GB_FRAME_US);
             continue;
         }
-        g_draw_fb = fb[draw_buf];
-        poll_input();
-        gb_run_frame(&gb);                   // emulate into the buffer core1 isn't reading
 
-        // Frame-skip gate. Auto (-1): try to show every frame, drop only when
-        // core1 is still busy. Fixed N (0..5): only attempt every (N+1)th frame,
-        // cutting blit load for heavy titles. Audio is fed every frame regardless.
-        bool want_show = (g_settings.frameskip < 0)
-                       ? true
-                       : ((frame_count % (uint32_t)(g_settings.frameskip + 1)) == 0);
+        const bool auto_mode = (g_settings.frameskip < 0);
+        bool want_show;
+
+        if (auto_mode) {
+            want_show = adaptive_frameskip_should_render(&s_auto_fs);
+        } else {
+            want_show =
+                ((frame_count %
+                  (uint32_t)(g_settings.frameskip + 1)) == 0);
+        }
         frame_count++;
 
-        // Hand the frame to core1 ONLY if we want to show it AND core1 is idle. If
-        // core1 is still blitting the previous frame (slow SPI), don't wait -- keep
-        // emulating into this same buffer (dropping the undisplayed frame). That
-        // keeps the audio feed below on a rock-steady cadence no matter how slow the
-        // blit is: audio is master, video drops frames. When SPI is fast, nothing drops.
-        if (want_show && !g_core1_busy) {
-            g_core1_busy = true;
-            multicore_fifo_push_blocking((uint32_t)draw_buf);
-            draw_buf ^= 1;                   // core1 now owns the old buffer; use the other
+        bool display_ready = (!s_frame_done && s_rd == s_wr);
+        bool display_blocked = want_show && !display_ready;
+
+        s_stream_this = want_show && display_ready;
+        g_capture_frame = s_stream_this;
+
+        /*
+         * Previously PicoBoy only suppressed draw_line(), so Peanut still spent
+         * most of the CGB PPU cost constructing scanlines that were discarded.
+         * Tell Peanut up-front whether this frame will actually be presented.
+         */
+        gb->direct.skip_render = s_stream_this ? 0u : 1u;
+
+        poll_input();
+        gb_run_frame(gb);
+
+        if (s_stream_this) {
+            __sync_synchronize();
+            s_frame_done = true;
         }
 
-        // Audio is the frame clock: i2s_dma_write waits for the previous buffer to
-        // drain, pacing this loop to the exact 44100 Hz rate. Only fall back to the
-        // sleep pacer if audio isn't running.
+        if (s_rom_io_failed) {
+            quit = true;
+        }
+
         bool audio_paced = snd_play_frame();
-        if (!audio_paced) sleep_until(next_frame);
+
+        if (auto_mode) {
+            adaptive_frameskip_feedback(
+                &s_auto_fs,
+                adaptive_frameskip_signal(
+                    display_blocked,
+                    audio_paced ? snd_dma_wait_us() : UINT32_MAX));
+        }
+
+        if (!audio_paced)
+            sleep_until(next_frame);
+
         next_frame = delayed_by_us(next_frame, GB_FRAME_US);
-        if (to_us_since_boot(next_frame) < to_us_since_boot(get_absolute_time()))
+        if (to_us_since_boot(next_frame) <
+            to_us_since_boot(get_absolute_time())) {
             next_frame = make_timeout_time_us(GB_FRAME_US);
+        }
     }
 
-    while (g_core1_busy) tight_loop_contents();  // let the last blit finish
-    multicore_reset_core1();                     // stop the display core cleanly
+    display_drain();
+    s_core1_run = false;
+    while (!s_core1_idle)
+        tight_loop_contents();
+    multicore_reset_core1();
 
-    // Battery save: write cart RAM back to the .srm now that the game has exited
-    // and both cores are quiesced.
     if (g_save_size > 0 && g_save_path[0]) {
         led_set_state(LED_SD_BUSY);
         FIL f;
-        if (f_open(&f, g_save_path, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
+        if (f_open(&f, g_save_path,
+                   FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
             UINT bw = 0;
             f_write(&f, cart_ram, (UINT)g_save_size, &bw);
             f_close(&f);
         }
     }
+
+    rom_close_tail();
+
+    if (s_rom_io_failed)
+        show_error("SD ROM read failed");
 }
