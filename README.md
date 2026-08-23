@@ -181,23 +181,6 @@ reason. Press **B** to back out.
 
 ---
 
-## ROM staging and flash safety
-
-PicoBoy runs one emulator core at a time and stages the selected ROM into onboard
-flash before launching it. In 1.0.4 the ROM window is **not a fixed address**:
-the firmware finds the actual end of its linked image, rounds up to a flash erase
-boundary, leaves a complete guard sector, and uses the remaining space up to the
-settings / NVS sector.
-
-This keeps ROM erase/program operations from overlapping the firmware as PicoBoy
-grows, while still giving every core the same staged-ROM interface.
-
-> **1.0.4 note:** the legacy `tools/rom2uf2.py` fixed-offset workflow targets the
-> old `0x80000` staging address and is **not compatible with the dynamic 1.0.4
-> layout**. Use **Browse ROMs** from microSD to stage games.
-
----
-
 ## Repository layout
 
 ```
