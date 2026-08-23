@@ -113,6 +113,7 @@ ROMs are not included — use games you legally own.
 | **B** | Back / cancel | Game input |
 | **START / SELECT** | — | Game input |
 | **MENU** | — | Open the in-game menu |
+| **Start + Menu** | Start USB Mass Storage (Main Menu only) | - |
 
 ### Main menu
 
