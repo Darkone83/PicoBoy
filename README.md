@@ -76,7 +76,7 @@ inserted. If you want to lay the card out yourself first, the 1.0.4 structure is
 SD card root
 ├── roms/
 │   ├── gb/      <- Game Boy ROMs       (.gb)
-|	├── gbc/     <- Game Boy  Color ROMs(.gbc)
+|	├── gbc/     <- Game Boy Color ROMs (.gbc)
 │   ├── nes/     <- NES ROMs            (.nes)
 │   ├── fc/      <- Famicom ROMs        (.nes)
 │   ├── sms/     <- Master System ROMs  (.sms)
