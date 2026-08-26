@@ -29,7 +29,7 @@ designed to make the most of the RP2040's limited RAM.
 - **Atari 2600 NTSC emulation** — `.a26` / `.bin`, 2K, 4K, F8, F6, F4, and common Superchip variants
 - **Atari phosphor persistence** to reduce intentional alternating-frame flicker used by some 2600 games
 - **Dynamic protected ROM staging** — the flash ROM window follows the linked firmware size instead of relying on a fixed address
-- **Shared 132 KiB emulator arena** with one active core at a time to keep permanent SRAM use low
+- **Shared 129 KiB emulator arena** with one active core at a time to keep permanent SRAM use low
 - **Selectable colour palettes** for Game Boy games
 - **On-screen battery meter** with charging, full, low-battery, and critical-battery states
 - **Themeable UI**
