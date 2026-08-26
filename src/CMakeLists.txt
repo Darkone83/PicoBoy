@@ -68,6 +68,7 @@ add_executable(picoboy
     src/z80.c
     src/usb_msc.c
     src/usb_descriptors.c
+    src/fps_overlay.c
 )
 
 # Compile the WS2812 PIO program into a generated header.

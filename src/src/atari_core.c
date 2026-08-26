@@ -20,6 +20,7 @@
 #include "led.h"
 #include "audio.h"
 #include "settings.h"
+#include "fps_overlay.h"
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -153,6 +154,8 @@ static void __not_in_flash_func(atari_core1_display)(void) {
                 dst[x * 2 + 1] = (uint8_t)p;
             }
 
+            if (g_settings.show_fps && y < 7)
+                fps_overlay_row_be(dst, ATARI_DST_W, y);
             st7789_stream_row(dst, ATARI_DST_W);
             rb ^= 1;
         }
@@ -487,6 +490,7 @@ bool atari_machine_tia_write_complete(void) {
 }
 
 static void machine_process_frame(void) {
+    if (g_settings.show_fps) fps_overlay_frame();
     const bool auto_mode = (g_settings.frameskip < 0);
 
     bool want_show = auto_mode
@@ -538,6 +542,7 @@ static void machine_process_frame(void) {
         } else {
             snd_atari_open();
             adaptive_frameskip_reset(&m.auto_fs);
+            fps_overlay_reset();
             m.capture_this_frame = true;
             memset(s_fb[m.draw], 0, ATARI_FB_BYTES);
             poll_input();
@@ -622,6 +627,7 @@ void atari_core_run(void) {
     m.capture_started = false;
     m.prev_vsync = atari_tia_vsync();
     adaptive_frameskip_reset(&m.auto_fs);
+    fps_overlay_reset();
     m.capture_this_frame = true;
 
     while (!m.quit && !atari_cpu_halted()) {

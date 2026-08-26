@@ -3,7 +3,7 @@
 
 // Shared RAM arena. Only ONE emulator core runs at a time, so GB, NES, Atari,
 // SMS and Game Gear can carve their large runtime buffers from the same region.
-#define ARENA_BYTES       (130u * 1024u)
+#define ARENA_BYTES       (129u * 1024u)
 
 /*
  * All emulator cores also share one stereo I2S staging buffer. Reserve 3 KiB at

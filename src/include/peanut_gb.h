@@ -110,11 +110,13 @@
 
 /*
  * PicoBoy RP2040 optimization:
- * fixPalette[] is stored as panel-ready RGB565 instead of the preliminary
- * CGB branch's RGB555. This moves conversion from every rendered pixel to
- * the much rarer CGB palette-register writes.
+ * fixPalette[] is stored as panel-ready RGB565 with the bytes pre-swapped for
+ * PicoBoy's big-endian ST7789 stream.  The line callback can therefore write
+ * one aligned uint16_t per pixel instead of shifting and issuing two byte
+ * stores.  Conversion/swap happens only on the much rarer palette writes.
  */
 #define PEANUT_GB_CGB_FIXPALETTE_RGB565 1
+#define PEANUT_GB_CGB_FIXPALETTE_STREAM16 1
 
 /*
  * PicoBoy CGB renderer optimization:
@@ -955,6 +957,39 @@ uint8_t __not_in_flash_func(__gb_read)(struct gb_s *gb, uint16_t addr)
 	PGB_UNREACHABLE();
 }
 
+/*
+ * Fast program-counter fetch. The opcode fetch and every immediate operand
+ * fetch read through PC, which lives in cartridge ROM on effectively every
+ * instruction -- the single most frequent memory access in the machine, and
+ * twice as much work per frame under CGB double-speed. Bypass the __gb_read()
+ * call and its 16-way address decode for the ROM0/ROMX ranges, using the very
+ * same direct-window macros __gb_read() uses internally, and fall back to the
+ * full path only for code executing from VRAM/WRAM/HRAM or a boot ROM window.
+ */
+#if defined(PEANUT_GB_DIRECT_ROM0_READ) && defined(PEANUT_GB_DIRECT_ROMX_READ)
+static inline uint8_t __attribute__((always_inline))
+pb_fetch_pc_i(struct gb_s *gb)
+{
+	uint16_t a = gb->cpu_reg.pc.reg++;
+	if(a >= 0x8000u)
+		return __gb_read(gb, a);
+	if(a >= 0x4000u)
+		return PEANUT_GB_DIRECT_ROMX_READ(gb, a);
+	/* ROM bank 0. Only defer to __gb_read() when a boot ROM is actually mapped
+	 * over the low 256 bytes -- never the case once IO_BANK has latched. */
+	if(gb->gb_bootrom_read != NULL && gb->hram_io[IO_BANK] == 0 && a < 0x0100u)
+		return __gb_read(gb, a);
+	return PEANUT_GB_DIRECT_ROM0_READ(gb, a);
+}
+#else
+static inline uint8_t __attribute__((always_inline))
+pb_fetch_pc_i(struct gb_s *gb)
+{
+	return __gb_read(gb, gb->cpu_reg.pc.reg++);
+}
+#endif
+static uint8_t __not_in_flash_func(pb_fetch_pc)(struct gb_s *gb) { return pb_fetch_pc_i(gb); }
+
 /**
  * Internal function used to write bytes.
  */
@@ -1358,12 +1393,15 @@ void __not_in_flash_func(__gb_write)(struct gb_s *gb, uint_fast16_t addr, uint8_
 
 		/* CGB BG Palette*/
 		case 0x69:
+		{
 			gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3F)] = val;
 			fixPaletteTemp = (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E) + 1] << 8) + (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E)]);
-			fixPaletteTemp = ((fixPaletteTemp & 0x7C00) >> 10) | (fixPaletteTemp & 0x03E0) | ((fixPaletteTemp & 0x001F) << 10);  // swap Red and Blue -> RGB555
-			gb->cgb.fixPalette[((gb->cgb.BGPaletteID & 0x3E) >> 1)] = ((fixPaletteTemp & 0x7FE0) << 1) | (fixPaletteTemp & 0x001F);  // RGB555 -> RGB565
-			if(gb->cgb.BGPaletteInc) gb->cgb.BGPaletteID = (++gb->cgb.BGPaletteID) & 0x3F;
+			fixPaletteTemp = ((fixPaletteTemp & 0x7C00) >> 10) | (fixPaletteTemp & 0x03E0) | ((fixPaletteTemp & 0x001F) << 10);  // BGR555 -> RGB555
+			uint16_t rgb565 = (uint16_t)(((fixPaletteTemp & 0x7FE0) << 1) | (fixPaletteTemp & 0x001F));
+			gb->cgb.fixPalette[((gb->cgb.BGPaletteID & 0x3E) >> 1)] = (uint16_t)((rgb565 << 8) | (rgb565 >> 8));
+			if(gb->cgb.BGPaletteInc) gb->cgb.BGPaletteID = (uint8_t)((gb->cgb.BGPaletteID + 1) & 0x3F);
 			return;
+		}
 
 		/* CGB OAM Palette Index*/
 		case 0x6A:
@@ -1373,12 +1411,15 @@ void __not_in_flash_func(__gb_write)(struct gb_s *gb, uint_fast16_t addr, uint8_
 
 		/* CGB OAM Palette*/
 		case 0x6B:
+		{
 			gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3F)] = val;
 			fixPaletteTemp = (gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E) + 1] << 8) + (gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E)]);
-			fixPaletteTemp = ((fixPaletteTemp & 0x7C00) >> 10) | (fixPaletteTemp & 0x03E0) | ((fixPaletteTemp & 0x001F) << 10);  // swap Red and Blue -> RGB555
-			gb->cgb.fixPalette[0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1)] = ((fixPaletteTemp & 0x7FE0) << 1) | (fixPaletteTemp & 0x001F);  // RGB555 -> RGB565
-			if(gb->cgb.OAMPaletteInc) gb->cgb.OAMPaletteID = (++gb->cgb.OAMPaletteID) & 0x3F;
+			fixPaletteTemp = ((fixPaletteTemp & 0x7C00) >> 10) | (fixPaletteTemp & 0x03E0) | ((fixPaletteTemp & 0x001F) << 10);  // BGR555 -> RGB555
+			uint16_t rgb565 = (uint16_t)(((fixPaletteTemp & 0x7FE0) << 1) | (fixPaletteTemp & 0x001F));
+			gb->cgb.fixPalette[0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1)] = (uint16_t)((rgb565 << 8) | (rgb565 >> 8));
+			if(gb->cgb.OAMPaletteInc) gb->cgb.OAMPaletteID = (uint8_t)((gb->cgb.OAMPaletteID + 1) & 0x3F);
 			return;
+		}
 
 		/* CGB WRAM Bank*/
 		case 0x70:
@@ -1402,7 +1443,7 @@ void __not_in_flash_func(__gb_write)(struct gb_s *gb, uint_fast16_t addr, uint8_
 uint8_t __not_in_flash_func(__gb_execute_cb)(struct gb_s *gb)
 {
 	uint8_t inst_cycles;
-	uint8_t cbop = __gb_read(gb, gb->cpu_reg.pc.reg++);
+	uint8_t cbop = pb_fetch_pc_i(gb);
 	uint8_t r = (cbop & 0x7);
 	uint8_t b = (cbop >> 3) & 0x7;
 	uint8_t d = (cbop >> 3) & 0x1;
@@ -1642,8 +1683,6 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 		return;
 #endif
 
-	uint8_t pixels[160] = {0};
-
 	/* If LCD not initialised by front-end, don't render anything. */
 	if(gb->display.lcd_draw_line == NULL)
 		return;
@@ -1651,18 +1690,40 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 	if(gb->direct.frame_skip && !gb->display.frame_skip_count)
 		return;
 
+	/* Frame/line invariants hoisted out of the per-pixel loops. cgbMode is
+	 * fixed for the whole game; LCDC and LY are fixed for the duration of one
+	 * line render (Peanut draws each line atomically at mode 3). Reading each
+	 * once removes a pointer-chase per pixel across the BG, window and sprite
+	 * loops. In a DMG-only build cgb is a compile-time 0 so every GBC branch
+	 * dead-code-eliminates exactly as before. */
+#if PEANUT_FULL_GBC_SUPPORT
+	const uint8_t cgb  = gb->cgb.cgbMode;
+#else
+	const uint8_t cgb  = 0;
+#endif
+	const uint8_t lcdc = gb->hram_io[IO_LCDC];
+	const uint8_t ly   = gb->hram_io[IO_LY];
+
+	/* CGB always renders a full background line (the BG pass writes all 160
+	 * pixels before sprites), and so does DMG whenever BG is enabled. The
+	 * clear is only needed when the BG pass is skipped (DMG with BG disabled)
+	 * so sprite priority reads still see defined pixels. */
+	uint8_t pixels[160];
+	if(!(cgb || (lcdc & LCDC_BG_ENABLE)))
+		memset(pixels, 0, sizeof pixels);
+
 	/* If interlaced mode is activated, check if we need to draw the current
 	 * line. */
 	if(gb->direct.interlace)
 	{
 		if((gb->display.interlace_count == 0
-				&& (gb->hram_io[IO_LY] & 1) == 0)
+				&& (ly & 1) == 0)
 				|| (gb->display.interlace_count == 1
-				    && (gb->hram_io[IO_LY] & 1) == 1))
+				    && (ly & 1) == 1))
 		{
 			/* Compensate for missing window draw if required. */
-			if(gb->hram_io[IO_LCDC] & LCDC_WINDOW_ENABLE
-					&& gb->hram_io[IO_LY] >= gb->display.WY
+			if(lcdc & LCDC_WINDOW_ENABLE
+					&& ly >= gb->display.WY
 					&& gb->hram_io[IO_WX] <= 166)
 				gb->display.window_clear++;
 
@@ -1672,9 +1733,9 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 
 	/* If background is enabled, draw it. */
 #if PEANUT_FULL_GBC_SUPPORT
-	if(gb->cgb.cgbMode || gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE)
+	if(cgb || lcdc & LCDC_BG_ENABLE)
 #else
-	if(gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE)
+	if(lcdc & LCDC_BG_ENABLE)
 #endif
 	{
 		uint8_t bg_y, disp_x, bg_x, idx, py, px, t1, t2;
@@ -1683,14 +1744,14 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 		/* Calculate current background line to draw. Constant because
 		 * this function draws only this one line each time it is
 		 * called. */
-		bg_y = gb->hram_io[IO_LY] + gb->hram_io[IO_SCY];
+		bg_y = ly + gb->hram_io[IO_SCY];
 
 		/* Get selected background map address for first tile
 		 * corresponding to current line.
 		 * 0x20 (32) is the width of a background tile, and the bit
 		 * shift is to calculate the address. */
 		bg_map =
-			((gb->hram_io[IO_LCDC] & LCDC_BG_MAP) ?
+			((lcdc & LCDC_BG_MAP) ?
 			 VRAM_BMAP_2 : VRAM_BMAP_1)
 			+ (bg_y >> 3) * 0x20;
 
@@ -1712,13 +1773,13 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 		px = 7 - (bg_x & 0x07);
 
 		/* Select addressing mode. */
-		if(gb->hram_io[IO_LCDC] & LCDC_TILE_SELECT)
+		if(lcdc & LCDC_TILE_SELECT)
 			tile = VRAM_TILES_1 + idx * 0x10;
 		else
 			tile = VRAM_TILES_2 + ((idx + 0x80) % 0x100) * 0x10;
 
 #if PEANUT_FULL_GBC_SUPPORT
-		if(gb->cgb.cgbMode)
+		if(cgb)
 		{
 			if(idxAtt & 0x08) tile += 0x2000; //VRAM bank 2
 			if(idxAtt & 0x40) tile += 2 * (7 - py);
@@ -1729,7 +1790,7 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 		}
 
 		/* fetch first tile */
-		if(gb->cgb.cgbMode && (idxAtt & 0x20))
+		if(cgb && (idxAtt & 0x20))
 		{  //Horizantal Flip
 			t1 = gb->vram[tile] << px;
 			t2 = gb->vram[tile + 1] << px;
@@ -1759,13 +1820,13 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 #if PEANUT_FULL_GBC_SUPPORT
 				idxAtt = gb->vram[bg_map + (bg_x >> 3) + 0x2000];
 #endif
-				if(gb->hram_io[IO_LCDC] & LCDC_TILE_SELECT)
+				if(lcdc & LCDC_TILE_SELECT)
 					tile = VRAM_TILES_1 + idx * 0x10;
 				else
 					tile = VRAM_TILES_2 + ((idx + 0x80) % 0x100) * 0x10;
 
 #if PEANUT_FULL_GBC_SUPPORT
-				if(gb->cgb.cgbMode)
+				if(cgb)
 				{
 					if(idxAtt & 0x08) tile += 0x2000; //VRAM bank 2
 					if(idxAtt & 0x40) tile += 2 * (7 - py);
@@ -1783,7 +1844,7 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 
 			/* copy background */
 #if PEANUT_FULL_GBC_SUPPORT
-			if(gb->cgb.cgbMode && (idxAtt & 0x20))
+			if(cgb && (idxAtt & 0x20))
 			{  //Horizantal Flip
 				c = (((t1 & 0x80) >> 1) | (t2 & 0x80)) >> 6;
 				pixels[disp_x] = (uint8_t)(((idxAtt & 0x07) << 2) + c
@@ -1794,7 +1855,7 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 			else
 			{
 				c = (t1 & 0x1) | ((t2 & 0x1) << 1);
-				if(gb->cgb.cgbMode)
+				if(cgb)
 				{
 					pixels[disp_x] = (uint8_t)(((idxAtt & 0x07) << 2) + c
 						| (idxAtt & PEANUT_GB_CGB_PIXEL_BG_PRIORITY));
@@ -1823,15 +1884,15 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 	}
 
 	/* draw window */
-	if(gb->hram_io[IO_LCDC] & LCDC_WINDOW_ENABLE
-			&& gb->hram_io[IO_LY] >= gb->display.WY
+	if(lcdc & LCDC_WINDOW_ENABLE
+			&& ly >= gb->display.WY
 			&& gb->hram_io[IO_WX] <= 166)
 	{
 		uint16_t win_line, tile;
 		uint8_t disp_x, win_x, py, px, idx, t1, t2, end;
 
 		/* Calculate Window Map Address. */
-		win_line = (gb->hram_io[IO_LCDC] & LCDC_WINDOW_MAP) ?
+		win_line = (lcdc & LCDC_WINDOW_MAP) ?
 				    VRAM_BMAP_2 : VRAM_BMAP_1;
 		win_line += (gb->display.window_clear >> 3) * 0x20;
 
@@ -1846,13 +1907,13 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 		uint8_t idxAtt = gb->vram[win_line + (win_x >> 3) + 0x2000];
 #endif
 
-		if(gb->hram_io[IO_LCDC] & LCDC_TILE_SELECT)
+		if(lcdc & LCDC_TILE_SELECT)
 			tile = VRAM_TILES_1 + idx * 0x10;
 		else
 			tile = VRAM_TILES_2 + ((idx + 0x80) % 0x100) * 0x10;
 
 #if PEANUT_FULL_GBC_SUPPORT
-		if(gb->cgb.cgbMode)
+		if(cgb)
 		{
 			if(idxAtt & 0x08) tile += 0x2000; //VRAM bank 2
 			if(idxAtt & 0x40) tile += 2 * (7 - py);
@@ -1863,7 +1924,7 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 		}
 
 		// fetch first tile
-		if(gb->cgb.cgbMode && (idxAtt & 0x20))
+		if(cgb && (idxAtt & 0x20))
 		{  //Horizantal Flip
 			t1 = gb->vram[tile] << px;
 			t2 = gb->vram[tile + 1] << px;
@@ -1897,13 +1958,13 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 				idxAtt = gb->vram[win_line + (win_x >> 3) + 0x2000];
 #endif
 
-				if(gb->hram_io[IO_LCDC] & LCDC_TILE_SELECT)
+				if(lcdc & LCDC_TILE_SELECT)
 					tile = VRAM_TILES_1 + idx * 0x10;
 				else
 					tile = VRAM_TILES_2 + ((idx + 0x80) % 0x100) * 0x10;
 
 #if PEANUT_FULL_GBC_SUPPORT
-				if(gb->cgb.cgbMode)
+				if(cgb)
 				{
 					if(idxAtt & 0x08) tile += 0x2000; //VRAM bank 2
 					if(idxAtt & 0x40) tile += 2 * (7 - py);
@@ -1932,7 +1993,7 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 			else
 			{
 				c = (t1 & 0x1) | ((t2 & 0x1) << 1);
-				if(gb->cgb.cgbMode)
+				if(cgb)
 				{
 					pixels[disp_x] = (uint8_t)(((idxAtt & 0x07) << 2) + c
 						| (idxAtt & PEANUT_GB_CGB_PIXEL_BG_PRIORITY));
@@ -1963,7 +2024,7 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 	}
 
 	// draw sprites
-	if(gb->hram_io[IO_LCDC] & LCDC_OBJ_ENABLE)
+	if(lcdc & LCDC_OBJ_ENABLE)
 	{
 		uint8_t sprite_number;
 #if PEANUT_GB_HIGH_LCD_ACCURACY
@@ -1984,9 +2045,9 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 			uint8_t OX = gb->oam[4 * sprite_number + 1];
 
 			/* If sprite isn't on this line, continue. */
-			if(gb->hram_io[IO_LY] +
-				(gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0 : 8) >= OY
-					|| gb->hram_io[IO_LY] + 16 < OY)
+			if(ly +
+				(lcdc & LCDC_OBJ_SIZE ? 0 : 8) >= OY
+					|| ly + 16 < OY)
 				continue;
 
 
@@ -1999,12 +2060,12 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 			 * sprites intersecting this scanline are found, later OAM entries
 			 * cannot participate and need not be scanned.
 			 */
-			if(gb->cgb.cgbMode && number_of_sprites == MAX_SPRITES_LINE)
+			if(cgb && number_of_sprites == MAX_SPRITES_LINE)
 				break;
 #endif
 		}
 #if PEANUT_FULL_GBC_SUPPORT
-		if(!gb->cgb.cgbMode)
+		if(!cgb)
 		{
 #endif
 		/* If maximum number of sprites reached, prioritise X
@@ -2039,15 +2100,15 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 			uint8_t OX = gb->oam[4 * s + 1];
 			/* Sprite Tile/Pattern Number. */
 			uint8_t OT = gb->oam[4 * s + 2]
-				     & (gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0xFE : 0xFF);
+				     & (lcdc & LCDC_OBJ_SIZE ? 0xFE : 0xFF);
 			/* Additional attributes. */
 			uint8_t OF = gb->oam[4 * s + 3];
 
 #if !PEANUT_GB_HIGH_LCD_ACCURACY
 			/* If sprite isn't on this line, continue. */
-			if(gb->hram_io[IO_LY] +
-					(gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0 : 8) >= OY ||
-					gb->hram_io[IO_LY] + 16 < OY)
+			if(ly +
+					(lcdc & LCDC_OBJ_SIZE ? 0 : 8) >= OY ||
+					ly + 16 < OY)
 				continue;
 #endif
 
@@ -2056,14 +2117,14 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 				continue;
 
 			// y flip
-			py = gb->hram_io[IO_LY] - OY + 16;
+			py = ly - OY + 16;
 
 			if(OF & OBJ_FLIP_Y)
-				py = (gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 15 : 7) - py;
+				py = (lcdc & LCDC_OBJ_SIZE ? 15 : 7) - py;
 
 			// fetch the tile
 #if PEANUT_FULL_GBC_SUPPORT
-			if(gb->cgb.cgbMode)
+			if(cgb)
 			{
 				t1 = gb->vram[((OF & OBJ_BANK) << 10) + VRAM_TILES_1 + OT * 0x10 + 2 * py];
 				t2 = gb->vram[((OF & OBJ_BANK) << 10) + VRAM_TILES_1 + OT * 0x10 + 2 * py + 1];
@@ -2103,9 +2164,9 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 				uint8_t c = (t1 & 0x1) | ((t2 & 0x1) << 1);
 				// check transparency / sprite overlap / background overlap
 #if PEANUT_FULL_GBC_SUPPORT
-				if(gb->cgb.cgbMode)
+				if(cgb)
 				{
-					uint8_t isBackgroundDisabled = c && !(gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE);
+					uint8_t isBackgroundDisabled = c && !(lcdc & LCDC_BG_ENABLE);
 					uint8_t isPixelPriorityNonConflicting = c &&
 															!((pixels[disp_x] & PEANUT_GB_CGB_PIXEL_BG_PRIORITY) &&
 													  (pixels[disp_x] & 0x03)) &&
@@ -2141,7 +2202,7 @@ void __not_in_flash_func(__gb_draw_line)(struct gb_s *gb)
 		}
 	}
 
-	gb->display.lcd_draw_line(gb, pixels, gb->hram_io[IO_LY]);
+	gb->display.lcd_draw_line(gb, pixels, ly);
 }
 #endif
 
@@ -2226,7 +2287,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	}
 
 	/* Obtain opcode */
-	opcode = __gb_read(gb, gb->cpu_reg.pc.reg++);
+	opcode = pb_fetch_pc_i(gb);
 	inst_cycles = op_cycles[opcode];
 
 	/* Execute opcode */
@@ -2236,8 +2297,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x01: /* LD BC, imm */
-		gb->cpu_reg.bc.bytes.c = __gb_read(gb, gb->cpu_reg.pc.reg++);
-		gb->cpu_reg.bc.bytes.b = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.bc.bytes.c = pb_fetch_pc(gb);
+		gb->cpu_reg.bc.bytes.b = pb_fetch_pc(gb);
 		break;
 
 	case 0x02: /* LD (BC), A */
@@ -2260,7 +2321,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x06: /* LD B, imm */
-		gb->cpu_reg.bc.bytes.b = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.bc.bytes.b = pb_fetch_pc(gb);
 		break;
 
 	case 0x07: /* RLCA */
@@ -2275,8 +2336,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	{
 		uint8_t h, l;
 		uint16_t temp;
-		l = __gb_read(gb, gb->cpu_reg.pc.reg++);
-		h = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		l = pb_fetch_pc(gb);
+		h = pb_fetch_pc(gb);
 		temp = PEANUT_GB_U8_TO_U16(h,l);
 		__gb_write(gb, temp++, gb->cpu_reg.sp.bytes.p);
 		__gb_write(gb, temp, gb->cpu_reg.sp.bytes.s);
@@ -2314,7 +2375,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x0E: /* LD C, imm */
-		gb->cpu_reg.bc.bytes.c = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.bc.bytes.c = pb_fetch_pc(gb);
 		break;
 
 	case 0x0F: /* RRCA */
@@ -2337,8 +2398,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x11: /* LD DE, imm */
-		gb->cpu_reg.de.bytes.e = __gb_read(gb, gb->cpu_reg.pc.reg++);
-		gb->cpu_reg.de.bytes.d = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.de.bytes.e = pb_fetch_pc(gb);
+		gb->cpu_reg.de.bytes.d = pb_fetch_pc(gb);
 		break;
 
 	case 0x12: /* LD (DE), A */
@@ -2361,7 +2422,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x16: /* LD D, imm */
-		gb->cpu_reg.de.bytes.d = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.de.bytes.d = pb_fetch_pc(gb);
 		break;
 
 	case 0x17: /* RLA */
@@ -2377,7 +2438,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 
 	case 0x18: /* JR imm */
 	{
-		int8_t temp = (int8_t) __gb_read(gb, gb->cpu_reg.pc.reg++);
+		int8_t temp = (int8_t) pb_fetch_pc(gb);
 		gb->cpu_reg.pc.reg += temp;
 		break;
 	}
@@ -2413,7 +2474,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x1E: /* LD E, imm */
-		gb->cpu_reg.de.bytes.e = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.de.bytes.e = pb_fetch_pc(gb);
 		break;
 
 	case 0x1F: /* RRA */
@@ -2430,7 +2491,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	case 0x20: /* JR NZ, imm */
 		if(!gb->cpu_reg.f_bits.z)
 		{
-			int8_t temp = (int8_t) __gb_read(gb, gb->cpu_reg.pc.reg++);
+			int8_t temp = (int8_t) pb_fetch_pc(gb);
 			gb->cpu_reg.pc.reg += temp;
 			inst_cycles += 4;
 		}
@@ -2440,8 +2501,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x21: /* LD HL, imm */
-		gb->cpu_reg.hl.bytes.l = __gb_read(gb, gb->cpu_reg.pc.reg++);
-		gb->cpu_reg.hl.bytes.h = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.hl.bytes.l = pb_fetch_pc(gb);
+		gb->cpu_reg.hl.bytes.h = pb_fetch_pc(gb);
 		break;
 
 	case 0x22: /* LDI (HL), A */
@@ -2465,7 +2526,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x26: /* LD H, imm */
-		gb->cpu_reg.hl.bytes.h = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.hl.bytes.h = pb_fetch_pc(gb);
 		break;
 
 	case 0x27: /* DAA */
@@ -2503,7 +2564,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	case 0x28: /* JR Z, imm */
 		if(gb->cpu_reg.f_bits.z)
 		{
-			int8_t temp = (int8_t) __gb_read(gb, gb->cpu_reg.pc.reg++);
+			int8_t temp = (int8_t) pb_fetch_pc(gb);
 			gb->cpu_reg.pc.reg += temp;
 			inst_cycles += 4;
 		}
@@ -2541,7 +2602,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x2E: /* LD L, imm */
-		gb->cpu_reg.hl.bytes.l = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.hl.bytes.l = pb_fetch_pc(gb);
 		break;
 
 	case 0x2F: /* CPL */
@@ -2553,7 +2614,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	case 0x30: /* JR NC, imm */
 		if(!gb->cpu_reg.f_bits.c)
 		{
-			int8_t temp = (int8_t) __gb_read(gb, gb->cpu_reg.pc.reg++);
+			int8_t temp = (int8_t) pb_fetch_pc(gb);
 			gb->cpu_reg.pc.reg += temp;
 			inst_cycles += 4;
 		}
@@ -2563,8 +2624,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x31: /* LD SP, imm */
-		gb->cpu_reg.sp.bytes.p = __gb_read(gb, gb->cpu_reg.pc.reg++);
-		gb->cpu_reg.sp.bytes.s = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.sp.bytes.p = pb_fetch_pc(gb);
+		gb->cpu_reg.sp.bytes.s = pb_fetch_pc(gb);
 		break;
 
 	case 0x32: /* LD (HL), A */
@@ -2597,7 +2658,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	}
 
 	case 0x36: /* LD (HL), imm */
-		__gb_write(gb, gb->cpu_reg.hl.reg, __gb_read(gb, gb->cpu_reg.pc.reg++));
+		__gb_write(gb, gb->cpu_reg.hl.reg, pb_fetch_pc(gb));
 		break;
 
 	case 0x37: /* SCF */
@@ -2609,7 +2670,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	case 0x38: /* JR C, imm */
 		if(gb->cpu_reg.f_bits.c)
 		{
-			int8_t temp = (int8_t) __gb_read(gb, gb->cpu_reg.pc.reg++);
+			int8_t temp = (int8_t) pb_fetch_pc(gb);
 			gb->cpu_reg.pc.reg += temp;
 			inst_cycles += 4;
 		}
@@ -2652,7 +2713,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0x3E: /* LD A, imm */
-		gb->cpu_reg.a = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.a = pb_fetch_pc(gb);
 		break;
 
 	case 0x3F: /* CCF */
@@ -3267,7 +3328,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		if(!gb->cpu_reg.f_bits.z)
 		{
 			uint8_t p, c;
-			c = __gb_read(gb, gb->cpu_reg.pc.reg++);
+			c = pb_fetch_pc(gb);
 			p = __gb_read(gb, gb->cpu_reg.pc.reg);
 			gb->cpu_reg.pc.bytes.c = c;
 			gb->cpu_reg.pc.bytes.p = p;
@@ -3281,7 +3342,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	case 0xC3: /* JP imm */
 	{
 		uint8_t p, c;
-		c = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		c = pb_fetch_pc(gb);
 		p = __gb_read(gb, gb->cpu_reg.pc.reg);
 		gb->cpu_reg.pc.bytes.c = c;
 		gb->cpu_reg.pc.bytes.p = p;
@@ -3292,8 +3353,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		if(!gb->cpu_reg.f_bits.z)
 		{
 			uint8_t p, c;
-			c = __gb_read(gb, gb->cpu_reg.pc.reg++);
-			p = __gb_read(gb, gb->cpu_reg.pc.reg++);
+			c = pb_fetch_pc(gb);
+			p = pb_fetch_pc(gb);
 			__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.p);
 			__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.c);
 			gb->cpu_reg.pc.bytes.c = c;
@@ -3312,7 +3373,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 
 	case 0xC6: /* ADD A, imm */
 	{
-		uint8_t val = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		uint8_t val = pb_fetch_pc(gb);
 		PGB_INSTR_ADC_R8(val, 0);
 		break;
 	}
@@ -3343,7 +3404,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		if(gb->cpu_reg.f_bits.z)
 		{
 			uint8_t p, c;
-			c = __gb_read(gb, gb->cpu_reg.pc.reg++);
+			c = pb_fetch_pc(gb);
 			p = __gb_read(gb, gb->cpu_reg.pc.reg);
 			gb->cpu_reg.pc.bytes.c = c;
 			gb->cpu_reg.pc.bytes.p = p;
@@ -3362,8 +3423,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		if(gb->cpu_reg.f_bits.z)
 		{
 			uint8_t p, c;
-			c = __gb_read(gb, gb->cpu_reg.pc.reg++);
-			p = __gb_read(gb, gb->cpu_reg.pc.reg++);
+			c = pb_fetch_pc(gb);
+			p = pb_fetch_pc(gb);
 			__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.p);
 			__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.c);
 			gb->cpu_reg.pc.bytes.c = c;
@@ -3378,8 +3439,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	case 0xCD: /* CALL imm */
 	{
 		uint8_t p, c;
-		c = __gb_read(gb, gb->cpu_reg.pc.reg++);
-		p = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		c = pb_fetch_pc(gb);
+		p = pb_fetch_pc(gb);
 		__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.p);
 		__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.c);
 		gb->cpu_reg.pc.bytes.c = c;
@@ -3389,7 +3450,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 
 	case 0xCE: /* ADC A, imm */
 	{
-		uint8_t val = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		uint8_t val = pb_fetch_pc(gb);
 		PGB_INSTR_ADC_R8(val, gb->cpu_reg.f_bits.c);
 		break;
 	}
@@ -3419,7 +3480,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		if(!gb->cpu_reg.f_bits.c)
 		{
 			uint8_t p, c;
-			c = __gb_read(gb, gb->cpu_reg.pc.reg++);
+			c = pb_fetch_pc(gb);
 			p = __gb_read(gb, gb->cpu_reg.pc.reg);
 			gb->cpu_reg.pc.bytes.c = c;
 			gb->cpu_reg.pc.bytes.p = p;
@@ -3434,8 +3495,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		if(!gb->cpu_reg.f_bits.c)
 		{
 			uint8_t p, c;
-			c = __gb_read(gb, gb->cpu_reg.pc.reg++);
-			p = __gb_read(gb, gb->cpu_reg.pc.reg++);
+			c = pb_fetch_pc(gb);
+			p = pb_fetch_pc(gb);
 			__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.p);
 			__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.c);
 			gb->cpu_reg.pc.bytes.c = c;
@@ -3454,7 +3515,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 
 	case 0xD6: /* SUB imm */
 	{
-		uint8_t val = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		uint8_t val = pb_fetch_pc(gb);
 		uint16_t temp = gb->cpu_reg.a - val;
 		gb->cpu_reg.f_bits.z = ((temp & 0xFF) == 0x00);
 		gb->cpu_reg.f_bits.n = 1;
@@ -3493,7 +3554,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		if(gb->cpu_reg.f_bits.c)
 		{
 			uint8_t p, c;
-			c = __gb_read(gb, gb->cpu_reg.pc.reg++);
+			c = pb_fetch_pc(gb);
 			p = __gb_read(gb, gb->cpu_reg.pc.reg);
 			gb->cpu_reg.pc.bytes.c = c;
 			gb->cpu_reg.pc.bytes.p = p;
@@ -3508,8 +3569,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		if(gb->cpu_reg.f_bits.c)
 		{
 			uint8_t p, c;
-			c = __gb_read(gb, gb->cpu_reg.pc.reg++);
-			p = __gb_read(gb, gb->cpu_reg.pc.reg++);
+			c = pb_fetch_pc(gb);
+			p = pb_fetch_pc(gb);
 			__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.p);
 			__gb_write(gb, --gb->cpu_reg.sp.reg, gb->cpu_reg.pc.bytes.c);
 			gb->cpu_reg.pc.bytes.c = c;
@@ -3523,7 +3584,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 
 	case 0xDE: /* SBC A, imm */
 	{
-		uint8_t val = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		uint8_t val = pb_fetch_pc(gb);
 		PGB_INSTR_SBC_R8(val, gb->cpu_reg.f_bits.c);
 		break;
 	}
@@ -3535,7 +3596,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0xE0: /* LD (0xFF00+imm), A */
-		__gb_write(gb, 0xFF00 | __gb_read(gb, gb->cpu_reg.pc.reg++),
+		__gb_write(gb, 0xFF00 | pb_fetch_pc(gb),
 			   gb->cpu_reg.a);
 		break;
 
@@ -3555,7 +3616,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 
 	case 0xE6: /* AND imm */
 		/* TODO: Optimisation? */
-		gb->cpu_reg.a = gb->cpu_reg.a & __gb_read(gb, gb->cpu_reg.pc.reg++);
+		gb->cpu_reg.a = gb->cpu_reg.a & pb_fetch_pc(gb);
 		gb->cpu_reg.f_bits.z = (gb->cpu_reg.a == 0x00);
 		gb->cpu_reg.f_bits.n = 0;
 		gb->cpu_reg.f_bits.h = 1;
@@ -3570,7 +3631,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 
 	case 0xE8: /* ADD SP, imm */
 	{
-		int8_t offset = (int8_t) __gb_read(gb, gb->cpu_reg.pc.reg++);
+		int8_t offset = (int8_t) pb_fetch_pc(gb);
 		gb->cpu_reg.f_bits.z = 0;
 		gb->cpu_reg.f_bits.n = 0;
 		gb->cpu_reg.f_bits.h = ((gb->cpu_reg.sp.reg & 0xF) + (offset & 0xF) > 0xF) ? 1 : 0;
@@ -3587,15 +3648,15 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	{
 		uint8_t h, l;
 		uint16_t addr;
-		l = __gb_read(gb, gb->cpu_reg.pc.reg++);
-		h = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		l = pb_fetch_pc(gb);
+		h = pb_fetch_pc(gb);
 		addr = PEANUT_GB_U8_TO_U16(h, l);
 		__gb_write(gb, addr, gb->cpu_reg.a);
 		break;
 	}
 
 	case 0xEE: /* XOR imm */
-		PGB_INSTR_XOR_R8(__gb_read(gb, gb->cpu_reg.pc.reg++));
+		PGB_INSTR_XOR_R8(pb_fetch_pc(gb));
 		break;
 
 	case 0xEF: /* RST 0x0028 */
@@ -3606,7 +3667,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 
 	case 0xF0: /* LD A, (0xFF00+imm) */
 		gb->cpu_reg.a =
-			__gb_read(gb, 0xFF00 | __gb_read(gb, gb->cpu_reg.pc.reg++));
+			__gb_read(gb, 0xFF00 | pb_fetch_pc(gb));
 		break;
 
 	case 0xF1: /* POP AF */
@@ -3636,7 +3697,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 		break;
 
 	case 0xF6: /* OR imm */
-		PGB_INSTR_OR_R8(__gb_read(gb, gb->cpu_reg.pc.reg++));
+		PGB_INSTR_OR_R8(pb_fetch_pc(gb));
 		break;
 
 	case 0xF7: /* PUSH AF */
@@ -3648,7 +3709,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	case 0xF8: /* LD HL, SP+/-imm */
 	{
 		/* Taken from SameBoy, which is released under MIT Licence. */
-		int8_t offset = (int8_t) __gb_read(gb, gb->cpu_reg.pc.reg++);
+		int8_t offset = (int8_t) pb_fetch_pc(gb);
 		gb->cpu_reg.hl.reg = gb->cpu_reg.sp.reg + offset;
 		gb->cpu_reg.f_bits.z = 0;
 		gb->cpu_reg.f_bits.n = 0;
@@ -3666,8 +3727,8 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 	{
 		uint8_t h, l;
 		uint16_t addr;
-		l = __gb_read(gb, gb->cpu_reg.pc.reg++);
-		h = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		l = pb_fetch_pc(gb);
+		h = pb_fetch_pc(gb);
 		addr = PEANUT_GB_U8_TO_U16(h, l);
 		gb->cpu_reg.a = __gb_read(gb, addr);
 		break;
@@ -3679,7 +3740,7 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 
 	case 0xFE: /* CP imm */
 	{
-		uint8_t val = __gb_read(gb, gb->cpu_reg.pc.reg++);
+		uint8_t val = pb_fetch_pc(gb);
 		PGB_INSTR_CP_R8(val);
 		break;
 	}
@@ -3884,33 +3945,45 @@ void __not_in_flash_func(__gb_step_cpu)(struct gb_s *gb)
 					inst_cycles = LCD_MODE_2_CYCLES - gb->counter.lcd_count;
 			}
 		}
-		/* OAM access */
-		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_HBLANK &&
-				gb->counter.lcd_count >= LCD_MODE_2_CYCLES)
+		else
 		{
-			gb->hram_io[IO_STAT] =
-				(gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_SEARCH_OAM;
+			/* Exact LCD event scheduling.  Preserve Peanut's existing mode
+			 * transition points, but inspect STAT mode once and only test the
+			 * threshold that can be relevant in that mode.  This is especially
+			 * useful in CGB double-speed mode where this block is visited about
+			 * twice as often for the same LCD progress. */
+			const uint8_t lcd_mode = gb->hram_io[IO_STAT] & STAT_MODE;
 
-			if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
-				gb->hram_io[IO_IF] |= LCDC_INTR;
+			if(lcd_mode == IO_STAT_MODE_HBLANK)
+			{
+				if(gb->counter.lcd_count >= LCD_MODE_2_CYCLES)
+				{
+					gb->hram_io[IO_STAT] =
+						(gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_SEARCH_OAM;
 
-			/* If halted immediately jump to next LCD mode. */
-			if (gb->counter.lcd_count < LCD_MODE_3_CYCLES)
-				inst_cycles = LCD_MODE_3_CYCLES - gb->counter.lcd_count;
-		}
-		/* Update LCD */
-		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_SEARCH_OAM &&
-				gb->counter.lcd_count >= LCD_MODE_3_CYCLES)
-		{
-			gb->hram_io[IO_STAT] =
-				(gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_SEARCH_TRANSFER;
+					if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
+						gb->hram_io[IO_IF] |= LCDC_INTR;
+
+					/* If halted immediately jump to next LCD mode. */
+					if(gb->counter.lcd_count < LCD_MODE_3_CYCLES)
+						inst_cycles = LCD_MODE_3_CYCLES - gb->counter.lcd_count;
+				}
+			}
+			else if(lcd_mode == IO_STAT_MODE_SEARCH_OAM)
+			{
+				if(gb->counter.lcd_count >= LCD_MODE_3_CYCLES)
+				{
+					gb->hram_io[IO_STAT] =
+						(gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_SEARCH_TRANSFER;
 #if ENABLE_LCD
-			if(!gb->lcd_blank)
-				__gb_draw_line(gb);
+					if(!gb->lcd_blank)
+						__gb_draw_line(gb);
 #endif
-			/* If halted immediately jump to next LCD mode. */
-			if (gb->counter.lcd_count < LCD_MODE_0_CYCLES)
-				inst_cycles = LCD_MODE_0_CYCLES - gb->counter.lcd_count;
+					/* If halted immediately jump to next LCD mode. */
+					if(gb->counter.lcd_count < LCD_MODE_0_CYCLES)
+						inst_cycles = LCD_MODE_0_CYCLES - gb->counter.lcd_count;
+				}
+			}
 		}
 	} while(gb->gb_halt && (gb->hram_io[IO_IF] & gb->hram_io[IO_IE]) == 0);
 	/* If halted, loop until an interrupt occurs. */

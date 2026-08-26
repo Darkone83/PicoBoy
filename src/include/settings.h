@@ -12,6 +12,7 @@ typedef struct {
     uint8_t gg_scaled;       // Game Gear display: 0 = Native, 1 = Scaled (240x216)
     uint8_t nes_scaled;      // NES display: 0 = Native, 1 = Scaled (~8:7 aspect, 293x232)
     uint8_t usb_sd_access;   // 0 = charge-only USB, 1 = expose SD as USB MSC from main menu
+    uint8_t show_fps;        // 0 = off, 1 = show emulated FPS in-game
 } settings_t;
 
 extern settings_t g_settings;

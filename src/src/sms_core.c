@@ -16,6 +16,7 @@
 #include "ui.h"
 #include "theme.h"
 #include "settings.h"
+#include "fps_overlay.h"
 #include "led.h"
 #include "audio.h"
 #include "ff.h"
@@ -184,6 +185,7 @@ static void __not_in_flash_func(sms_core1_stream)(void) {
     int dy = SMS_DST_Y;
     int dh = SMS_NATIVE_H;
     bool frame_gg_scaled = false;
+    int out_y = 0;
 
     /*
      * s_send is the next ring slot Core1 intends to submit.
@@ -230,9 +232,13 @@ static void __not_in_flash_func(sms_core1_stream)(void) {
                 st7789_stream_begin(dx, dy, width, dh);
                 win = true;
                 have_inflight = false;
+                out_y = 0;
             }
 
-            const uint8_t *row = ring_row(s_send);
+            uint8_t *row = ring_row(s_send);
+            if (g_settings.show_fps && out_y < 7)
+                fps_overlay_row_be(row, width, out_y);
+            out_y++;
 
             st7789_stream_row(row, width);
 
@@ -258,6 +264,7 @@ static void __not_in_flash_func(sms_core1_stream)(void) {
             s_rd = s_send;
             have_inflight = false;
             s_frame_done = false; // acknowledge complete frame to core0
+            out_y = 0;
 
         } else {
             tight_loop_contents();
@@ -835,6 +842,7 @@ void sms_core_run(void) {
     unsigned frame_counter = 0;
     adaptive_frameskip_t auto_fs;
     adaptive_frameskip_reset(&auto_fs);
+    fps_overlay_reset();
     bool quit = false;
 
     while (!quit) {
@@ -850,6 +858,7 @@ void sms_core_run(void) {
                 break;
             }
             adaptive_frameskip_reset(&auto_fs);
+            fps_overlay_reset();
             buttons_update();
         }
 
@@ -874,6 +883,7 @@ void sms_core_run(void) {
         s_stream_this = !skip_render;
 
         sms_frame(skip_render ? 1 : 0);
+        if (g_settings.show_fps) fps_overlay_frame();
 
         if (s_stream_this)
             s_frame_done = true;

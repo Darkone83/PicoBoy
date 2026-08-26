@@ -8,6 +8,7 @@
 #include "pins.h"
 #include "audio.h"
 #include "settings.h"
+#include "fps_overlay.h"
 #include "arena.h"
 #include "adaptive_frameskip.h"
 #include "pico/stdlib.h"
@@ -84,6 +85,11 @@ static uint8_t __not_in_flash_func(pb_romx_miss)(struct gb_s *g, uint_fast16_t a
 static struct gb_s *gb = NULL;
 static uint8_t *cart_ram = NULL;
 static uint8_t *s_ring = NULL;
+
+// Two packed destination-row scratch buffers for Core1's single-window blit.
+// Arena-backed rather than core1-stack-resident so double-buffering the row
+// pack costs no extra stack (in fact the old single stack row[] is removed).
+static uint8_t *s_disp_row[2] = { NULL, NULL };
 
 
 // Loader-supplied ROM geometry. Small GB/GBC images are all-XIP.
@@ -476,13 +482,22 @@ static void __not_in_flash_func(draw_line)(struct gb_s *g,
     uint8_t *dst = ring_row(s_wr);
 
     if (g->cgb.cgbMode) {
+#if defined(PEANUT_GB_CGB_FIXPALETTE_STREAM16)
+        /* Newer CGB hot path: fixPalette[] already contains RGB565 with its
+         * bytes pre-swapped for the ST7789 stream.  The arena row is aligned,
+         * so preserve that representation with one halfword store per pixel. */
+        uint16_t *dst16 = (uint16_t *)dst;
+        for (int x = 0; x < GB_W; x++)
+            dst16[x] = g->cgb.fixPalette[pixels[x] & 0x3Fu];
+#else
+        /* Original PicoBoy RGB565 fixPalette representation.  Keep explicit
+         * big-endian byte packing when Peanut has not enabled STREAM16. */
         for (int x = 0; x < GB_W; x++) {
-            // Patched Peanut keeps fixPalette[] in PicoBoy-ready RGB565, so the
-            // hot scanline loop is now only palette lookup + byte packing.
             uint16_t c = g->cgb.fixPalette[pixels[x] & 0x3Fu];
             dst[x * 2]     = (uint8_t)(c >> 8);
             dst[x * 2 + 1] = (uint8_t)c;
         }
+#endif
     } else {
         for (int x = 0; x < GB_W; x++) {
             uint16_t c =
@@ -499,7 +514,6 @@ static void __not_in_flash_func(draw_line)(struct gb_s *g,
 
 static void __not_in_flash_func(core1_display)(void) {
     uint8_t xmap[GB_DST_W];
-    uint8_t row[GB_DST_W * 2];
 
     // Same horizontal nearest-neighbour geometry as the previous GB path.
     // Build the map once on Core1 rather than doing division in the hot row loop.
@@ -509,7 +523,8 @@ static void __not_in_flash_func(core1_display)(void) {
     uint32_t send = 0;
     int sy = 0;
     int dy = 0;
-    int field = 0;
+    int cur = 0;
+    bool win = false;
 
     s_core1_idle = false;
     __sync_synchronize();
@@ -517,49 +532,82 @@ static void __not_in_flash_func(core1_display)(void) {
 
     while (s_core1_run) {
         if (send != s_wr) {
+            // Open ONE RAMWR window over the whole 266x240 active region on the
+            // first row of each presented frame. The panel auto-advances after
+            // each streamed row, so there is no per-row CASET/RASET/RAMWR setup
+            // and CS is held for the entire frame instead of toggled per row.
+            // This mirrors the streaming idiom already proven by the SMS and
+            // Atari cores. Pillarbox columns (0..26, 293..319) are never touched
+            // and stay black from the pre-launch st7789_fill(COL_BLACK).
+            if (!win) {
+                st7789_stream_begin(GB_DST_X, GB_DST_Y, GB_DST_W, GB_DST_H);
+                win = true;
+            }
+
             const uint8_t *src = ring_row(send);
+            uint8_t *dst = s_disp_row[cur];
 
             for (int x = 0; x < GB_DST_W; x++) {
                 int sx = xmap[x];
-                row[x * 2]     = src[sx * 2];
-                row[x * 2 + 1] = src[sx * 2 + 1];
+                dst[x * 2]     = src[sx * 2];
+                dst[x * 2 + 1] = src[sx * 2 + 1];
             }
 
-            // Source row is now copied into Core1-local scratch. Release the
-            // arena ring slot before touching SPI so Core0 can keep emulating.
+            /* FPS is stamped only into the final panel-format row.  Never
+             * touch the GB/CGB source ring: CGB may use a private STREAM16
+             * palette representation there. */
+            if (g_settings.show_fps && sy < 7)
+                fps_overlay_row_be(dst, GB_DST_W, sy);
+
+            // Source row is now copied into the Core1-owned packed buffer. The
+            // DMA reads from s_disp_row[], not the ring, so release the arena
+            // ring slot immediately and let Core0 keep emulating.
             send++;
             __sync_synchronize();
             s_rd = send;
 
-            // Preserve the known-good GB presentation model: update alternating
-            // destination rows each presented frame. The experimental scanline
-            // renderer originally pushed all 240 rows every frame, roughly
-            // doubling display traffic versus the stable GB core.
+            // 144 -> 240 nearest-neighbour vertical scaling, done on this side
+            // because the panel does not scale: stream this packed row once for
+            // every destination line that maps to this source line, in strictly
+            // increasing order into the open contiguous window.
             //
-            // 144 -> 240 nearest-neighbour still uses the same vertical mapping;
-            // only rows belonging to the current field are transferred.
+            // st7789_stream_row() waits for the previous row's DMA and then
+            // starts this one, so:
+            //   - re-streaming the SAME buffer for a doubled line is safe (the
+            //     second launch cannot begin until the first completes; the
+            //     buffer is unchanged between them), and
+            //   - packing the NEXT source row into the OTHER buffer overlaps the
+            //     in-flight DMA of this row (double-buffering).
             while (dy < GB_DST_H && ((dy * GB_H) / GB_DST_H) == sy) {
-                if ((dy & 1) == field)
-                    st7789_stream_row_at(GB_DST_X, GB_DST_Y + dy,
-                                         row, GB_DST_W);
+                st7789_stream_row(dst, GB_DST_W);
                 dy++;
             }
 
             sy++;
+            cur ^= 1;
 
         } else if (s_frame_done) {
+            // End of a presented frame: drain the final row DMA and release CS
+            // BEFORE clearing s_frame_done, so Core0's display_drain()/overlay
+            // path never touches SPI while a window is still open.
+            if (win) {
+                st7789_stream_end();
+                win = false;
+            }
+
             __sync_synchronize();
             s_rd = send;
             s_frame_done = false;
             sy = 0;
             dy = 0;
-            field ^= 1;
 
         } else {
             tight_loop_contents();
         }
     }
 
+    if (win)
+        st7789_stream_end();
     s_rd = send;
     s_core1_idle = true;
 }
@@ -841,6 +889,10 @@ void gb_core_run(void) {
     cart_ram = (uint8_t *)gb_arena_alloc(CART_RAM_BYTES);
     s_ring = (uint8_t *)gb_arena_alloc(GB_RING * GB_ROW_BYTES);
 
+    // Packed 266px destination rows for Core1's single-window streaming blit.
+    s_disp_row[0] = (uint8_t *)gb_arena_alloc(GB_DST_W * 2u);
+    s_disp_row[1] = (uint8_t *)gb_arena_alloc(GB_DST_W * 2u);
+
     bool split = (s_rom_size != 0 && s_flash_prefix < s_rom_size);
 
     for (unsigned i = 0; i < GB_SD_CACHE_BANKS; i++) {
@@ -857,6 +909,7 @@ void gb_core_run(void) {
                : NULL;
 
     if (!gb || !cart_ram || !s_ring ||
+        !s_disp_row[0] || !s_disp_row[1] ||
         (split && (!s_cache[0].data || !s_cache[1].data))) {
         show_error("Out of RAM (GB/GBC)");
         return;
@@ -954,6 +1007,7 @@ void gb_core_run(void) {
 
     snd_apu_reset();
     adaptive_frameskip_reset(&s_auto_fs);
+    fps_overlay_reset();
     g_capture_frame = true;
     gb->direct.skip_render = 0;
 
@@ -999,6 +1053,7 @@ void gb_core_run(void) {
 
             led_set_state(LED_RUNNING);
             adaptive_frameskip_reset(&s_auto_fs);
+            fps_overlay_reset();
             gb->direct.skip_render = 0;
             st7789_fill(COL_BLACK);
             buttons_update();
@@ -1033,6 +1088,7 @@ void gb_core_run(void) {
 
         poll_input();
         gb_run_frame(gb);
+        if (g_settings.show_fps) fps_overlay_frame();
 
         if (s_stream_this) {
             __sync_synchronize();

@@ -24,6 +24,7 @@ extern "C" {
 #include "ui.h"
 #include "theme.h"
 #include "settings.h"      // g_settings + settings_save() for the in-game overlay
+#include "fps_overlay.h"
 #include "flash.h"
 #include "nes_core.h"
 #include "ff.h"            // .srm battery SRAM saves
@@ -250,7 +251,10 @@ static void __not_in_flash_func(core1_stream)(void)
                 active = true; k = 0; field = s_field_cur;
             }
             int yrow = NES_STREAM_Y + field + 2 * k;
-            const uint8_t *row = nes_ring_row(s_rd);
+            int overlay_y = yrow - NES_STREAM_Y;
+            uint8_t *row = nes_ring_row(s_rd);
+            if (g_settings.show_fps && overlay_y < 7)
+                fps_overlay_row_be(row, NES_STREAM_W, overlay_y);
             if (g_settings.nes_scaled)
                 st7789_stream_row_8_7_at(NES_ASPECT_X, yrow, row, NES_STREAM_W);
             else
@@ -270,6 +274,7 @@ static void __not_in_flash_func(core1_stream)(void)
     s_core1_idle = true;
 #else
     bool win = false;
+    int row_y = 0;
     while (s_core1_run) {
         if (s_rd != s_wr) {                            // a line is waiting
             if (!win) {
@@ -278,8 +283,12 @@ static void __not_in_flash_func(core1_stream)(void)
                 else
                     st7789_stream_begin(NES_STREAM_X, NES_STREAM_Y, NES_STREAM_W, NES_STREAM_H);
                 win = true;
+                row_y = 0;
             }
-            const uint8_t *row = nes_ring_row(s_rd);  // native 256-wide packed RGB565
+            uint8_t *row = nes_ring_row(s_rd);  // native 256-wide packed RGB565
+            if (g_settings.show_fps && row_y < 7)
+                fps_overlay_row_be(row, NES_STREAM_W, row_y);
+            row_y++;
             if (g_settings.nes_scaled)
                 st7789_stream_row_8_7(row, NES_STREAM_W);
             else
@@ -291,6 +300,7 @@ static void __not_in_flash_func(core1_stream)(void)
                 st7789_stream_end(); win = false;
             }
             s_frame_done = false;                      // ack to core0
+            row_y = 0;
         } else {
             tight_loop_contents();                     // idle: no SPI touched (safe for the overlay)
         }
@@ -418,6 +428,7 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
 // so core0 never stalls. Audio is the master clock (snd_nes_flush below paces us).
 int InfoNES_LoadFrame(void)
 {
+    if (g_settings.show_fps) fps_overlay_frame();
     const bool rendered_frame = (FrameCnt == 0);
 
 #if NES_STREAM_FULLRES
@@ -775,6 +786,7 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
             return;
         }
         adaptive_frameskip_reset(&s_auto_fs);
+        fps_overlay_reset();
         s_auto_display_observed = false;
         s_auto_display_blocked = false;
         FrameCnt = 0;
@@ -902,6 +914,7 @@ extern "C" void nes_run(void)
         s_wr = s_rd = 0; s_frame_done = false;
         s_new_frame = true; s_stream_this = false;
         adaptive_frameskip_reset(&s_auto_fs);
+        fps_overlay_reset();
         s_auto_display_observed = false;
         s_auto_display_blocked = false;
         FrameCnt = 0;
