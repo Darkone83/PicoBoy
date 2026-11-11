@@ -69,6 +69,9 @@ static uint8_t __not_in_flash_func(pb_romx_miss)(struct gb_s *g, uint_fast16_t a
 #define GB_DST_Y 0
 
 #define GB_FRAME_US 16742u
+// On DMG, tolerate a small end-of-DMA handoff delay before sacrificing an
+// entire video frame. This bound avoids blocking the emulation loop forever.
+#define GB_DMG_DISPLAY_GRACE_US 400u
 
 #define CART_RAM_BYTES      (32u * 1024u)
 #define GB_RING              8u
@@ -499,12 +502,15 @@ static void __not_in_flash_func(draw_line)(struct gb_s *g,
         }
 #endif
     } else {
+        // DMG palette output only: the row is 4-byte aligned and the LCD
+        // expects big-endian RGB565 bytes. One byte-swapped halfword store
+        // replaces two separate byte writes per emulated pixel.
+        uint16_t *dst16 = (uint16_t *)dst;
         for (int x = 0; x < GB_W; x++) {
             uint16_t c =
                 g_palette[(pixels[x] & LCD_PALETTE_ALL) >> 4]
                          [pixels[x] & LCD_COLOUR];
-            dst[x * 2]     = (uint8_t)(c >> 8);
-            dst[x * 2 + 1] = (uint8_t)c;
+            dst16[x] = __builtin_bswap16(c);
         }
     }
 
@@ -547,10 +553,21 @@ static void __not_in_flash_func(core1_display)(void) {
             const uint8_t *src = ring_row(send);
             uint8_t *dst = s_disp_row[cur];
 
-            for (int x = 0; x < GB_DST_W; x++) {
-                int sx = xmap[x];
-                dst[x * 2]     = src[sx * 2];
-                dst[x * 2 + 1] = src[sx * 2 + 1];
+            if (gb->cgb.cgbMode) {
+                // Preserve the existing CGB packing path exactly.
+                for (int x = 0; x < GB_DST_W; x++) {
+                    int sx = xmap[x];
+                    dst[x * 2]     = src[sx * 2];
+                    dst[x * 2 + 1] = src[sx * 2 + 1];
+                }
+            } else {
+                // DMG: both buffers are halfword-aligned, so copying complete
+                // RGB565 pixels is cheaper and byte-identical to the two-byte
+                // scaling loop. No extra frame/row allocation is required.
+                const uint16_t *src16 = (const uint16_t *)src;
+                uint16_t *dst16 = (uint16_t *)dst;
+                for (int x = 0; x < GB_DST_W; x++)
+                    dst16[x] = src16[xmap[x]];
             }
 
             /* FPS is stamped only into the final panel-format row.  Never
@@ -1062,10 +1079,16 @@ void gb_core_run(void) {
         }
 
         const bool auto_mode = (g_settings.frameskip < 0);
+        const bool cgb_mode = (gb->cgb.cgbMode != 0);
         bool want_show;
 
         if (auto_mode) {
-            want_show = adaptive_frameskip_should_render(&s_auto_fs);
+            // The shared adaptive controller was tuned for expensive CGB
+            // frames and may collapse DMG motion to 15 FPS after brief DMA
+            // timing spikes. Keep DMG at full presentation cadence instead;
+            // actual display backlog is still handled below.
+            want_show = cgb_mode ? adaptive_frameskip_should_render(&s_auto_fs)
+                                 : true;
         } else {
             want_show =
                 ((frame_count %
@@ -1074,17 +1097,32 @@ void gb_core_run(void) {
         frame_count++;
 
         bool display_ready = (!s_frame_done && s_rd == s_wr);
+
+        // The DMG screen transfer is usually done by the next emulated frame,
+        // but a short DMA/stream-close tail should not cost a whole GB frame.
+        // Keep this strictly bounded so an overloaded display cannot stall
+        // emulation indefinitely or interfere with CGB pacing.
+        if (!cgb_mode && want_show && !display_ready) {
+            const uint32_t start_us = time_us_32();
+            do {
+                tight_loop_contents();
+                display_ready = (!s_frame_done && s_rd == s_wr);
+            } while (!display_ready &&
+                     (uint32_t)(time_us_32() - start_us) < GB_DMG_DISPLAY_GRACE_US);
+        }
         bool display_blocked = want_show && !display_ready;
 
         s_stream_this = want_show && display_ready;
         g_capture_frame = s_stream_this;
 
         /*
-         * Previously PicoBoy only suppressed draw_line(), so Peanut still spent
-         * most of the CGB PPU cost constructing scanlines that were discarded.
-         * Tell Peanut up-front whether this frame will actually be presented.
+         * CGB keeps its tested early PPU skip for expensive discarded frames.
+         * DMG must still run the normal PPU scanlines when not displaying:
+         * __gb_draw_line() advances window_clear internally, before calling
+         * draw_line(). Skipping the entire DMG PPU breaks that bookkeeping.
+         * draw_line() itself already ignores non-presented frames.
          */
-        gb->direct.skip_render = s_stream_this ? 0u : 1u;
+        gb->direct.skip_render = (cgb_mode && !s_stream_this) ? 1u : 0u;
 
         poll_input();
         gb_run_frame(gb);
@@ -1101,7 +1139,7 @@ void gb_core_run(void) {
 
         bool audio_paced = snd_play_frame();
 
-        if (auto_mode) {
+        if (auto_mode && cgb_mode) {
             adaptive_frameskip_feedback(
                 &s_auto_fs,
                 adaptive_frameskip_signal(
