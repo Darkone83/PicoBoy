@@ -231,7 +231,7 @@ static void update_square(int16_t* samples, const bool ch2)
 	}
 }
 
-static uint8_t wave_sample(const unsigned int pos, const unsigned int volume)
+static uint8_t wave_sample(const unsigned int pos)
 {
 	uint8_t sample;
 
@@ -241,7 +241,7 @@ static uint8_t wave_sample(const unsigned int pos, const unsigned int volume)
 	} else {
 		sample >>= 4;
 	}
-	return volume ? (sample >> (volume - 1)) : 0;
+	return sample; /* NR32 volume is applied once in update_wave(). */
 }
 
 static void update_wave(int16_t *samples)
@@ -267,13 +267,13 @@ static void update_wave(int16_t *samples)
 		uint32_t prev_pos = 0;
 		int32_t sample   = 0;
 
-		c->wave.sample = wave_sample(c->val, c->volume);
+		c->wave.sample = wave_sample(c->val);
 
 		while (update_freq(c, &pos)) {
 			c->val = (c->val + 1) & 31;
 			sample += ((pos - prev_pos) / c->freq_inc) *
 				((int)c->wave.sample - 8) * (INT16_MAX/64);
-			c->wave.sample = wave_sample(c->val, c->volume);
+			c->wave.sample = wave_sample(c->val);
 			prev_pos  = pos;
 		}
 
@@ -376,6 +376,16 @@ void audio_callback(void *userdata, int16_t *stream, size_t len)
 	update_square(stream, 1);
 	update_wave(stream);
 	update_noise(stream);
+
+	/*
+	 * PicoBoy has one speaker. Give the MAX98357A the same mono mix in
+	 * both I2S slots, regardless of its hardware channel-select strap.
+	 * Average using 32-bit arithmetic to avoid overflow.
+	 */
+	for (size_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
+		int32_t mono = ((int32_t)stream[i] + (int32_t)stream[i + 1]) / 2;
+		stream[i] = stream[i + 1] = (int16_t)mono;
+	}
 }
 
 static void chan_trigger(uint_fast8_t i)
