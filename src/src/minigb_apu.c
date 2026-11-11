@@ -208,21 +208,28 @@ static void update_square(int16_t* samples, const bool ch2)
 
 		uint32_t pos = 0;
 		uint32_t prev_pos = 0;
-		int32_t sample = 0;
+		bool transitioned = false;
+		int64_t sample = 0;
 
 		while (update_freq(c, &pos)) {
 			c->square.duty_counter = (c->square.duty_counter + 1) & 7;
-			sample += ((pos - prev_pos) / c->freq_inc) * c->val;
+			sample += (int64_t)(pos - prev_pos) * c->val;
 			c->val = (c->square.duty & (1 << c->square.duty_counter)) ?
 				VOL_INIT_MAX / MAX_CHAN_VOLUME :
 				VOL_INIT_MIN / MAX_CHAN_VOLUME;
 			prev_pos = pos;
+			transitioned = true;
 		}
 
 		if (c->muted)
 			continue;
 
-		sample += c->val;
+		if (transitioned) {
+			sample += (int64_t)(c->freq_inc - prev_pos) * c->val;
+			sample /= c->freq_inc;
+		} else {
+			sample = c->val;
+		}
 		sample *= c->volume;
 		sample /= 4;
 
@@ -265,19 +272,27 @@ static void update_wave(int16_t *samples)
 
 		uint32_t pos      = 0;
 		uint32_t prev_pos = 0;
-		int32_t sample   = 0;
+		bool transitioned = false;
+		int64_t sample   = 0;
 
 		c->wave.sample = wave_sample(c->val);
 
 		while (update_freq(c, &pos)) {
 			c->val = (c->val + 1) & 31;
-			sample += ((pos - prev_pos) / c->freq_inc) *
+			sample += (int64_t)(pos - prev_pos) *
 				((int)c->wave.sample - 8) * (INT16_MAX/64);
 			c->wave.sample = wave_sample(c->val);
 			prev_pos  = pos;
+			transitioned = true;
 		}
 
-		sample += ((int)c->wave.sample - 8) * (int)(INT16_MAX/64);
+		if (transitioned) {
+			sample += (int64_t)(c->freq_inc - prev_pos) *
+				((int)c->wave.sample - 8) * (INT16_MAX/64);
+			sample /= c->freq_inc;
+		} else {
+			sample = ((int)c->wave.sample - 8) * (INT16_MAX/64);
+		}
 
 		if (c->volume == 0)
 			continue;
@@ -328,7 +343,8 @@ static void update_noise(int16_t *samples)
 
 		uint32_t pos      = 0;
 		uint32_t prev_pos = 0;
-		int32_t sample    = 0;
+		bool transitioned = false;
+		int64_t sample    = 0;
 
 		while (update_freq(c, &pos)) {
 			c->noise.lfsr_reg = (c->noise.lfsr_reg << 1) |
@@ -346,14 +362,20 @@ static void update_noise(int16_t *samples)
 					VOL_INIT_MIN / MAX_CHAN_VOLUME;
 			}
 
-			sample += ((pos - prev_pos) / c->freq_inc) * c->val;
+			sample += (int64_t)(pos - prev_pos) * c->val;
 			prev_pos = pos;
+			transitioned = true;
 		}
 
 		if (c->muted)
 			continue;
 
-		sample += c->val;
+		if (transitioned) {
+			sample += (int64_t)(c->freq_inc - prev_pos) * c->val;
+			sample /= c->freq_inc;
+		} else {
+			sample = c->val;
+		}
 		sample *= c->volume;
 		sample /= 4;
 
