@@ -31,6 +31,24 @@
 
 #define MAX_CHAN_VOLUME		15
 
+/* The largest single-channel amplitude is 8 * (INT16_MAX / 64) = 4088.
+ * A time span <=500000 therefore fits a weighted 32-bit accumulator:
+ * 500000 * 4088 = 2,044,000,000 < INT32_MAX. Shrink long spans and all
+ * transition positions by the same power of two; small spans stay exact.
+ * We divide only on output samples containing a transition. */
+#define AUDIO_AREA_MAX_SPAN 500000u
+
+static inline uint32_t area_span(uint32_t inc, unsigned *shift)
+{
+    unsigned n = 0;
+    while (inc > AUDIO_AREA_MAX_SPAN) {
+        inc >>= 1;
+        ++n;
+    }
+    *shift = n;
+    return inc;
+}
+
 /**
  * Memory holding audio registers between 0xFF10 and 0xFF3F inclusive.
  */
@@ -208,25 +226,29 @@ static void update_square(int16_t* samples, const bool ch2)
 
 		uint32_t pos = 0;
 		uint32_t prev_pos = 0;
+		unsigned shift = 0;
+		const uint32_t span = area_span(c->freq_inc, &shift);
 		bool transitioned = false;
-		int64_t sample = 0;
+		int32_t sample = 0;
 
 		while (update_freq(c, &pos)) {
+			const uint32_t end = pos >> shift;
+			/* Weight the OLD level before advancing the duty counter. */
+			sample += (int32_t)(end - prev_pos) * (int32_t)c->val;
+			prev_pos = end;
 			c->square.duty_counter = (c->square.duty_counter + 1) & 7;
-			sample += (int64_t)(pos - prev_pos) * c->val;
 			c->val = (c->square.duty & (1 << c->square.duty_counter)) ?
 				VOL_INIT_MAX / MAX_CHAN_VOLUME :
 				VOL_INIT_MIN / MAX_CHAN_VOLUME;
-			prev_pos = pos;
 			transitioned = true;
 		}
 
 		if (c->muted)
 			continue;
 
-		if (transitioned) {
-			sample += (int64_t)(c->freq_inc - prev_pos) * c->val;
-			sample /= c->freq_inc;
+		if (transitioned && span) {
+			sample += (int32_t)(span - prev_pos) * (int32_t)c->val;
+			sample /= (int32_t)span;
 		} else {
 			sample = c->val;
 		}
@@ -263,6 +285,8 @@ static void update_wave(int16_t *samples)
 	set_note_freq(c, freq);
 
 	c->freq_inc *= 32;
+	unsigned shift = 0;
+	const uint32_t span = area_span(c->freq_inc, &shift);
 
 	for (uint_fast16_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
 		update_len(c);
@@ -273,23 +297,24 @@ static void update_wave(int16_t *samples)
 		uint32_t pos      = 0;
 		uint32_t prev_pos = 0;
 		bool transitioned = false;
-		int64_t sample   = 0;
+		int32_t sample = 0;
 
 		c->wave.sample = wave_sample(c->val);
 
 		while (update_freq(c, &pos)) {
+			const uint32_t end = pos >> shift;
+			sample += (int32_t)(end - prev_pos) *
+				((int32_t)c->wave.sample - 8) * (INT16_MAX/64);
+			prev_pos = end;
 			c->val = (c->val + 1) & 31;
-			sample += (int64_t)(pos - prev_pos) *
-				((int)c->wave.sample - 8) * (INT16_MAX/64);
 			c->wave.sample = wave_sample(c->val);
-			prev_pos  = pos;
 			transitioned = true;
 		}
 
-		if (transitioned) {
-			sample += (int64_t)(c->freq_inc - prev_pos) *
-				((int)c->wave.sample - 8) * (INT16_MAX/64);
-			sample /= c->freq_inc;
+		if (transitioned && span) {
+			sample += (int32_t)(span - prev_pos) *
+				((int32_t)c->wave.sample - 8) * (INT16_MAX/64);
+			sample /= (int32_t)span;
 		} else {
 			sample = ((int)c->wave.sample - 8) * (INT16_MAX/64);
 		}
@@ -333,6 +358,9 @@ static void update_noise(int16_t *samples)
 	if (c->freq >= 14)
 		c->enabled = 0;
 
+	unsigned shift = 0;
+	const uint32_t span = area_span(c->freq_inc, &shift);
+
 	for (uint_fast16_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
 		update_len(c);
 
@@ -344,9 +372,13 @@ static void update_noise(int16_t *samples)
 		uint32_t pos      = 0;
 		uint32_t prev_pos = 0;
 		bool transitioned = false;
-		int64_t sample    = 0;
+		int32_t sample = 0;
 
 		while (update_freq(c, &pos)) {
+			const uint32_t end = pos >> shift;
+			/* Integrate the OLD LFSR level, then advance the register. */
+			sample += (int32_t)(end - prev_pos) * (int32_t)c->val;
+			prev_pos = end;
 			c->noise.lfsr_reg = (c->noise.lfsr_reg << 1) |
 				(c->val >= VOL_INIT_MAX/MAX_CHAN_VOLUME);
 
@@ -362,17 +394,15 @@ static void update_noise(int16_t *samples)
 					VOL_INIT_MIN / MAX_CHAN_VOLUME;
 			}
 
-			sample += (int64_t)(pos - prev_pos) * c->val;
-			prev_pos = pos;
 			transitioned = true;
 		}
 
 		if (c->muted)
 			continue;
 
-		if (transitioned) {
-			sample += (int64_t)(c->freq_inc - prev_pos) * c->val;
-			sample /= c->freq_inc;
+		if (transitioned && span) {
+			sample += (int32_t)(span - prev_pos) * (int32_t)c->val;
+			sample /= (int32_t)span;
 		} else {
 			sample = c->val;
 		}
