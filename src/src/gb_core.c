@@ -69,12 +69,14 @@ static uint8_t __not_in_flash_func(pb_romx_miss)(struct gb_s *g, uint_fast16_t a
 #define GB_DST_Y 0
 
 #define GB_FRAME_US 16742u
-// On DMG, tolerate a small end-of-DMA handoff delay before sacrificing an
-// entire video frame. This bound avoids blocking the emulation loop forever.
-#define GB_DMG_DISPLAY_GRACE_US 400u
+// DMG-only larger scanline queue: it lets the emulator finish a frame and
+// feed I2S without waiting for the almost-full-width ST7789 transfer. Keep
+// the 8-row path for CGB/split-ROM cartridges to preserve their RAM budget.
+// Both capacities are powers of two for cheap row wrapping (no division).
+#define GB_RING_DMG            128u
 
 #define CART_RAM_BYTES      (32u * 1024u)
-#define GB_RING              8u
+#define GB_RING_MIN          8u
 #define GB_ROW_BYTES         (GB_W * 2u)
 #define GB_ROM_BANK_BYTES    0x4000u
 // Experimental mapped-bank backend: preserve the same 32 KiB cache budget as
@@ -88,6 +90,7 @@ static uint8_t __not_in_flash_func(pb_romx_miss)(struct gb_s *g, uint_fast16_t a
 static struct gb_s *gb = NULL;
 static uint8_t *cart_ram = NULL;
 static uint8_t *s_ring = NULL;
+static uint32_t s_ring_rows = GB_RING_MIN;
 
 // Two packed destination-row scratch buffers for Core1's single-window blit.
 // Arena-backed rather than core1-stack-resident so double-buffering the row
@@ -470,7 +473,7 @@ static volatile bool s_core1_started = false;
 static bool s_stream_this = false;
 
 static inline uint8_t *ring_row(uint32_t i) {
-    return s_ring + (i % GB_RING) * GB_ROW_BYTES;
+    return s_ring + (i & (s_ring_rows - 1u)) * GB_ROW_BYTES;
 }
 
 static void __not_in_flash_func(draw_line)(struct gb_s *g,
@@ -479,7 +482,7 @@ static void __not_in_flash_func(draw_line)(struct gb_s *g,
     if (!g_capture_frame || !s_stream_this || !s_ring || line >= GB_H)
         return;
 
-    while ((uint32_t)(s_wr - s_rd) >= GB_RING)
+    while ((uint32_t)(s_wr - s_rd) >= s_ring_rows)
         tight_loop_contents();
 
     uint8_t *dst = ring_row(s_wr);
@@ -901,10 +904,11 @@ done:
 
 void gb_core_run(void) {
     gb_arena_reset();
+    s_ring = NULL;
+    s_ring_rows = GB_RING_MIN;
 
     gb = (struct gb_s *)gb_arena_alloc(sizeof(struct gb_s));
     cart_ram = (uint8_t *)gb_arena_alloc(CART_RAM_BYTES);
-    s_ring = (uint8_t *)gb_arena_alloc(GB_RING * GB_ROW_BYTES);
 
     // Packed 266px destination rows for Core1's single-window streaming blit.
     s_disp_row[0] = (uint8_t *)gb_arena_alloc(GB_DST_W * 2u);
@@ -925,7 +929,7 @@ void gb_core_run(void) {
                ? (DWORD *)gb_arena_alloc(GB_FASTSEEK_CLMT_DWORDS * sizeof(DWORD))
                : NULL;
 
-    if (!gb || !cart_ram || !s_ring ||
+    if (!gb || !cart_ram ||
         !s_disp_row[0] || !s_disp_row[1] ||
         (split && (!s_cache[0].data || !s_cache[1].data))) {
         show_error("Out of RAM (GB/GBC)");
@@ -972,7 +976,6 @@ void gb_core_run(void) {
 
     memset(gb, 0, sizeof *gb);
     memset(cart_ram, 0, CART_RAM_BYTES);
-    memset(s_ring, 0, GB_RING * GB_ROW_BYTES);
     rom_cache_reset();
 
     if (split) {
@@ -998,6 +1001,27 @@ void gb_core_run(void) {
                                                  : "Unsupported cartridge");
         return;
     }
+
+    // Wait until gb_init has identified DMG versus CGB before choosing the
+    // scanline queue. Normal DMG games are staged in flash and have room for
+    // 128 source rows (~40 KiB) within the existing one-hot emulator arena.
+    // This decouples Core0 emulation/audio from Core1's SPI transfer. No new
+    // persistent .bss, heap allocation, or change to the CGB display path.
+    // Large SD-backed carts and CGB stay on the original 8-row queue.
+    if (!split && !gb->cgb.cgbMode) {
+        s_ring = (uint8_t *)gb_arena_alloc(GB_RING_DMG * GB_ROW_BYTES);
+        if (s_ring)
+            s_ring_rows = GB_RING_DMG;
+    }
+    if (!s_ring)
+        s_ring = (uint8_t *)gb_arena_alloc(GB_RING_MIN * GB_ROW_BYTES);
+    if (!s_ring) {
+        rom_close_tail();
+        show_error("Out of RAM (GB display)");
+        return;
+    }
+
+    memset(s_ring, 0, s_ring_rows * GB_ROW_BYTES);
 
     gb_init_lcd(gb, draw_line);
     apply_palette();
@@ -1098,18 +1122,8 @@ void gb_core_run(void) {
 
         bool display_ready = (!s_frame_done && s_rd == s_wr);
 
-        // The DMG screen transfer is usually done by the next emulated frame,
-        // but a short DMA/stream-close tail should not cost a whole GB frame.
-        // Keep this strictly bounded so an overloaded display cannot stall
-        // emulation indefinitely or interfere with CGB pacing.
-        if (!cgb_mode && want_show && !display_ready) {
-            const uint32_t start_us = time_us_32();
-            do {
-                tight_loop_contents();
-                display_ready = (!s_frame_done && s_rd == s_wr);
-            } while (!display_ready &&
-                     (uint32_t)(time_us_32() - start_us) < GB_DMG_DISPLAY_GRACE_US);
-        }
+        // If the LCD is still finishing, skip this presentation instead of
+        // blocking the emulation core: audio must meet its DMA deadline.
         bool display_blocked = want_show && !display_ready;
 
         s_stream_this = want_show && display_ready;
